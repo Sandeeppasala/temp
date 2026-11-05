@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hindi Live Interpretation</title>
+<style>
+body{margin:0;background:#f4f7fa;color:#16233b;font:16px system-ui,sans-serif}
+main{max-width:620px;margin:32px auto;padding:25px;background:white;border-radius:18px;box-shadow:0 5px 25px #17314a16}
+h1{margin:0 0 8px;font-size:28px}.muted{color:#546579}.row{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}
+input,button{font:inherit;padding:12px;border-radius:9px}input{flex:1;min-width:150px;border:1px solid #b9c7d4}
+button{border:0;background:#1b6bba;color:white;cursor:pointer}button:disabled{opacity:.55}
+#caption{background:#eaf2fb;padding:16px;border-radius:12px;min-height:70px;font-size:22px}
+small{display:block;margin-top:8px}#status{font-weight:600}
+</style></head><body><main>
+<h1>🎧 Hindi Live</h1><p class="muted">Telugu → Hindi • Live interpretation for workshop attendees</p>
+<label for="code">Event access code</label>
+<div class="row"><input id="code" type="password" autocomplete="off" placeholder="Enter event code">
+<button id="join">Start Listening</button><button id="leave" disabled>Leave</button></div>
+<p id="status" role="status">Not connected</p>
+<p>Volume <input type="range" id="volume" min="0" max="100" value="85" aria-label="Volume"></p>
+<h2>हिंदी अनुवाद</h2><div id="caption" aria-live="polite">अनुवाद यहाँ दिखाई देगा।</div>
+<small id="details" class="muted"></small>
+<p class="muted">Use headphones. Keep this page open and your screen awake. New listeners hear future speech only. Translation may be delayed or imperfect.</p>
+</main><script>
+const $=id=>document.getElementById(id);
+let ws=null, ctx=null, gain=null, nextTime=0, connected=false, epoch=0;
+const status=s=>$('status').textContent=s;
+function cleanup(){
+  connected=false; epoch++; if(ws){ws.onclose=null;ws.close();ws=null}
+  if(ctx){ctx.close();ctx=null} gain=null;nextTime=0;
+  $('join').disabled=false;$('leave').disabled=true;
+}
+$('volume').oninput=()=>{if(gain)gain.gain.value=Number($('volume').value)/100};
+$('join').onclick=async()=>{
+  const code=$('code').value.trim();
+  if(!code){status('Enter the event code.');return}
+  cleanup();
+  try{
+    ctx=new (window.AudioContext||window.webkitAudioContext)();
+    await ctx.resume();
+    gain=ctx.createGain();gain.gain.value=Number($('volume').value)/100;
+    gain.connect(ctx.destination);
+    const myEpoch=epoch;
+    ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
+    $('join').disabled=true;$('leave').disabled=false;status('Connecting…');
+    ws.onopen=()=>ws.send(JSON.stringify({type:'auth',code}));
+    ws.onmessage=async event=>{
+      if(myEpoch!==epoch)return;
+      let msg;try{msg=JSON.parse(event.data)}catch{return}
+      if(msg.type==='status'){connected=true;status(msg.running?'Connected • translation live':'Connected • waiting for speaker');return}
+      if(msg.type==='warning'){status(msg.message);return}
+      if(msg.type!=='segment')return;
+      $('caption').textContent=msg.hindi;
+      $('details').textContent='Segment '+msg.seq+(msg.telugu?' • Telugu: '+msg.telugu:'');
+      // decodeAudioData may complete out of order. Reserve scheduling in arrival order.
+      const raw=atob(msg.audio), bytes=new Uint8Array(raw.length);
+      for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);
+      try{
+        const buffer=await ctx.decodeAudioData(bytes.buffer);
+        if(myEpoch!==epoch)return;
+        const source=ctx.createBufferSource();source.buffer=buffer;source.connect(gain);
+        const when=Math.max(ctx.currentTime+0.1,nextTime);
+        source.start(when);nextTime=when+buffer.duration;
+        if(nextTime-ctx.currentTime>35){status('Audio delay is building up. Ask organizer to pause briefly.')}
+      }catch(e){status('Audio playback problem: '+e.message)}
+    };
+    ws.onclose=ev=>{
+      if(myEpoch!==epoch)return;
+      cleanup();status(ev.code===1008?'Wrong event access code.':ev.code===1013?'Event is full.':'Disconnected. Tap Start Listening to reconnect.');
+    };
+    ws.onerror=()=>status('Connection error. Check event URL and internet.');
+  }catch(e){cleanup();status('Cannot start audio: '+e.message)}
+};
+$('leave').onclick=()=>{cleanup();status('Disconnected')};
+</script></body></html>
