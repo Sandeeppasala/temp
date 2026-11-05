@@ -80,3 +80,74 @@ Azure Speech Translation and Speech Synthesis are metered separately; check [Azu
 - **Phones cannot connect:** check tunnel and HTTPS, firewall, then open `/health`.
 - **Silence on iPhone:** tap Start Listening manually; keep Safari active, screen awake, volume audible; try a connected headphone.
 - **High delay:** shorten speech pauses/phrases; watch speaker pace, network and processing costs.
+
+---
+## Sarvam AI provider
+
+To use **Sarvam AI** instead of Azure, reinstall the dependencies from this
+branch, copy `.env.example` to `.env`, and set:
+
+```ini
+TRANSLATION_PROVIDER=sarvam
+SARVAM_API_KEY=your-private-key
+SARVAM_STT_MODEL=saaras:v4
+SARVAM_TRANSLATE_MODEL=sarvam-translate:v1
+SARVAM_TTS_MODEL=bulbul:v3
+SARVAM_TTS_SPEAKER=shubh
+EVENT_CODE=a-random-listener-code
+ADMIN_KEY=a-different-strong-admin-key
+```
+
+Restart `python -m uvicorn app:app --host 127.0.0.1 --port 8000`, open
+`/admin`, and select **Status**. It should show `provider: sarvam`. With a
+participant connected, select **Send test Hindi voice**, then **Start microphone**
+and speak Telugu through the Windows default input device.
+
+The Sarvam path is: **Windows default microphone (16 kHz mono, 16-bit PCM)
+→ Sarvam Saaras v4 streaming Telugu transcription → Sarvam Translate v1
+(`te-IN` to `hi-IN`) → Bulbul v3 Hindi WAV speech → existing WebSocket
+listener page**. No changes to attendee URLs, access codes or browser audio
+player. This mode uses the `sarvamai` SDK plus `sounddevice` for microphone
+capture. It does not require the RTX 3070 GPU.
+
+**Why separate translation?** Sarvam streaming STT mode=`translate` emits
+English, not Hindi. We use mode=`transcribe` and a separate Telugu-to-Hindi
+text translation call instead. Sarvam's Python streaming SDK expects base64
+**WAV** chunks; the app constructs one WAV header per half-second microphone
+chunk.
+
+Windows: select the desired microphone or USB mixer under **Settings → Sound →
+Input**. The input device must support 16-kHz mono capture or compatible
+resampling. If the device fails to open, check the Windows microphone
+permissions and available devices. PortAudio is installed through
+`sounddevice` and may require system runtimes on Windows.
+
+**Testing:**
+
+```powershell
+python -m unittest discover -s tests
+```
+
+This verifies audio WAV framing only. Sarvam network requests, microphone
+behavior, streaming latency, translations, and Hindi output require live
+testing with a valid Sarvam API key. We cannot verify those without a working
+microphone and credentials. Test at least a 10-minute Telugu meditation talk
+and multiple iPhone/Android browsers before the workshop.
+
+**Limitations:** The stream presently requires manually pressing Start after
+network failure; translation occurs on finalized utterances and has a delay.
+Long speech or a slow network can fill the translation queue and cause dropped
+phrases. WAV audio uses more bandwidth than MP3/Opus. The existing listener
+page, access control and HTTPS guidance remain unchanged. Do not share
+`SARVAM_API_KEY` or commit the `.env` file. Sarvam and Azure use external
+cloud processing and may incur charges.
+
+Try Sarvam Bulbul v4 Flash by setting `SARVAM_TTS_MODEL=bulbul:v4-flash`;
+clear `SARVAM_TTS_SPEAKER` or choose a v4-compatible voice (v3 voice IDs are
+not interchangeable). For Azure, set `TRANSLATION_PROVIDER=azure` and use
+your original Azure credentials.
+
+API references:
+- https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/streaming-api
+- https://docs.sarvam.ai/api-reference/text/translate-text
+- https://docs.sarvam.ai/api-reference/text-to-speech/convert

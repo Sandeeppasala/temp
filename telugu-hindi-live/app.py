@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 import azure.cognitiveservices.speech as speechsdk
+from sarvam_provider import SarvamMicrophone, text_translate, hindi_audio
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -24,6 +25,9 @@ app = FastAPI(title="Telugu → Hindi Live")
 event_code = os.getenv("EVENT_CODE", "")
 admin_key = os.getenv("ADMIN_KEY", "")
 max_listeners = int(os.getenv("MAX_LISTENERS", "25"))
+provider = os.getenv("TRANSLATION_PROVIDER", "azure").strip().lower()
+sarvam_session = None
+control_lock = asyncio.Lock()
 loop: Optional[asyncio.AbstractEventLoop] = None
 clients: set[WebSocket] = set()
 running = False
@@ -46,6 +50,29 @@ def azure_configured() -> bool:
     return bool(os.getenv("AZURE_SPEECH_KEY") and
                 os.getenv("AZURE_SPEECH_KEY") != "replace-with-your-speech-resource-key" and
                 os.getenv("AZURE_SPEECH_REGION"))
+
+
+def configured() -> bool:
+    if provider == "sarvam":
+        key = os.getenv("SARVAM_API_KEY", "")
+        return bool(key) and not key.startswith("replace-")
+    return provider == "azure" and azure_configured()
+
+
+def sarvam_recognized(text: str) -> None:
+    if running and translation_queue is not None:
+        if not translation_queue.full():
+            translation_queue.put_nowait((text, None))
+        else:
+            log.warning("Sarvam translation backlog full; dropping phrase")
+
+
+def sarvam_failed(exc: str) -> None:
+    global running
+    running = False
+    log.error("Sarvam transcription stopped: %s", exc)
+    asyncio.create_task(publish({"type": "warning", "message": "Sarvam microphone stream stopped; ask organizer to restart."}))
+    asyncio.create_task(publish({"type": "status", "running": False}))
 
 
 async def publish(packet: dict) -> None:
@@ -107,7 +134,12 @@ async def translation_worker() -> None:
         telugu, hindi = await translation_queue.get()
         try:
             # One ordered producer ensures all listeners hear identical segments.
-            audio = await asyncio.to_thread(synthesize_hindi, hindi)
+            if hindi is None:
+                hindi = await asyncio.to_thread(text_translate, telugu)
+            if not hindi:
+                continue
+            audio = await asyncio.to_thread(
+                hindi_audio if provider == "sarvam" else synthesize_hindi, hindi)
             sequence += 1
             await publish({
                 "type": "segment", "seq": sequence,
@@ -133,8 +165,11 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global running, recognizer, worker_task
+    global running, recognizer, worker_task, sarvam_session
     running = False
+    if sarvam_session:
+        await sarvam_session.stop()
+        sarvam_session = None
     if recognizer:
         await asyncio.to_thread(lambda: recognizer.stop_continuous_recognition_async().get())
         recognizer = None
@@ -165,86 +200,112 @@ def health():
 def status(x_admin_key: str | None = Header(default=None)):
     admin_auth(x_admin_key)
     return {"running": running, "listeners": len(clients),
-            "azure_configured": azure_configured()}
+            "azure_configured": azure_configured(),
+            "provider": provider, "provider_configured": configured()}
 
 
 @app.post("/api/start")
 async def start(x_admin_key: str | None = Header(default=None)):
-    global running, recognizer, translation_queue, worker_task
+    global running, recognizer, translation_queue, worker_task, sarvam_session
     admin_auth(x_admin_key)
-    if running:
-        return {"running": True}
-    if not event_code or event_code == admin_key:
-        raise HTTPException(400, "Set distinct EVENT_CODE and ADMIN_KEY in .env")
-    if not azure_configured():
-        raise HTTPException(400, "Configure AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in .env")
-    cfg = speechsdk.translation.SpeechTranslationConfig(
-        subscription=os.environ["AZURE_SPEECH_KEY"],
-        region=os.environ["AZURE_SPEECH_REGION"])
-    cfg.speech_recognition_language = "te-IN"
-    cfg.add_target_language("hi")
-    # Captures the default Windows microphone. Select the venue mic in Windows Sound settings.
-    mic = speechsdk.audio.AudioConfig(use_default_microphone=True)
-    recognizer = speechsdk.translation.TranslationRecognizer(
-        translation_config=cfg, audio_config=mic)
-    recognizer.recognized.connect(recognition_callback)
-    recognizer.canceled.connect(canceled_callback)
-    translation_queue = asyncio.Queue(maxsize=12)
-    worker_task = asyncio.create_task(translation_worker())
-    running = True
-    try:
-        await asyncio.to_thread(lambda: recognizer.start_continuous_recognition_async().get())
-    except Exception as exc:
-        running = False
-        worker_task.cancel()
-        recognizer = None
-        raise HTTPException(502, f"Unable to start Azure microphone recognition: {exc}") from exc
-    await publish({"type": "status", "running": True})
-    return {"running": True}
+    async with control_lock:
+        if running:
+            return {"running": True, "provider": provider}
+        if not event_code or event_code == admin_key:
+            raise HTTPException(400, "Set distinct EVENT_CODE and ADMIN_KEY in .env")
+        if provider not in ("azure", "sarvam"):
+            raise HTTPException(400, "TRANSLATION_PROVIDER must be azure or sarvam")
+        if not configured():
+            raise HTTPException(400, f"Configure {provider} API credentials in .env")
+        if sarvam_session:
+            await sarvam_session.stop()
+            sarvam_session = None
+        translation_queue = asyncio.Queue(maxsize=12)
+        worker_task = asyncio.create_task(translation_worker())
+        running = True
+        try:
+            if provider == "sarvam":
+                sarvam_session = SarvamMicrophone(sarvam_recognized, sarvam_failed)
+                await sarvam_session.start()
+            else:
+                cfg = speechsdk.translation.SpeechTranslationConfig(
+                    subscription=os.environ["AZURE_SPEECH_KEY"],
+                    region=os.environ["AZURE_SPEECH_REGION"])
+                cfg.speech_recognition_language = "te-IN"
+                cfg.add_target_language("hi")
+                mic = speechsdk.audio.AudioConfig(use_default_microphone=True)
+                recognizer = speechsdk.translation.TranslationRecognizer(
+                    translation_config=cfg, audio_config=mic)
+                recognizer.recognized.connect(recognition_callback)
+                recognizer.canceled.connect(canceled_callback)
+                await asyncio.to_thread(
+                    lambda: recognizer.start_continuous_recognition_async().get())
+        except Exception as exc:
+            running = False
+            if sarvam_session:
+                await sarvam_session.stop()
+                sarvam_session = None
+            if worker_task:
+                worker_task.cancel()
+                try:
+                    await worker_task
+                except asyncio.CancelledError:
+                    pass
+                worker_task = None
+            translation_queue = None
+            recognizer = None
+            raise HTTPException(502, f"Unable to start {provider} microphone: {exc}") from exc
+        await publish({"type": "status", "running": True})
+        return {"running": True, "provider": provider}
 
 
 @app.post("/api/stop")
 async def stop(x_admin_key: str | None = Header(default=None)):
-    global running, recognizer, worker_task, translation_queue
+    global running, recognizer, worker_task, translation_queue, sarvam_session
     admin_auth(x_admin_key)
-    running = False
-    if recognizer:
-        await asyncio.to_thread(lambda: recognizer.stop_continuous_recognition_async().get())
-        recognizer = None
-    # Process already recognized segments before stopping.
-    if translation_queue:
-        try:
-            await asyncio.wait_for(translation_queue.join(), timeout=20)
-        except asyncio.TimeoutError:
-            log.warning("Pending translations exceeded stop timeout")
-    if worker_task:
-        worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
-        worker_task = None
-    translation_queue = None
-    await publish({"type": "status", "running": False})
-    return {"running": False}
+    async with control_lock:
+        running = False
+        if sarvam_session:
+            await sarvam_session.stop()
+            sarvam_session = None
+        if recognizer:
+            await asyncio.to_thread(
+                lambda: recognizer.stop_continuous_recognition_async().get())
+            recognizer = None
+        if translation_queue:
+            try:
+                await asyncio.wait_for(translation_queue.join(), timeout=20)
+            except asyncio.TimeoutError:
+                log.warning("Pending translation queue did not drain")
+        if worker_task:
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+            worker_task = None
+        translation_queue = None
+        await publish({"type": "status", "running": False})
+        return {"running": False}
 
 
 @app.post("/api/test")
 async def test_voice(x_admin_key: str | None = Header(default=None)):
     global sequence
     admin_auth(x_admin_key)
-    if not azure_configured():
-        raise HTTPException(400, "Configure Azure Speech credentials first")
+    if not configured():
+        raise HTTPException(400, f"Configure {provider} credentials first")
     hindi = "नमस्ते। हिंदी अनुवाद की ध्वनि परीक्षण सफल रहा।"
     try:
-        audio = await asyncio.to_thread(synthesize_hindi, hindi)
+        audio = await asyncio.to_thread(
+            hindi_audio if provider == "sarvam" else synthesize_hindi, hindi)
     except Exception as exc:
         raise HTTPException(502, f"Audio test failed: {exc}") from exc
     sequence += 1
     await publish({"type": "segment", "seq": sequence, "telugu": "",
                    "hindi": hindi, "mime": "audio/wav",
                    "audio": base64.b64encode(audio).decode("ascii")})
-    return {"sent": True, "listeners": len(clients)}
+    return {"sent": True, "listeners": len(clients), "provider": provider}
 
 
 @app.websocket("/ws")
