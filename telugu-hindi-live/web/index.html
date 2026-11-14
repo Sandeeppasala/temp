@@ -17,25 +17,34 @@ small{display:block;margin-top:8px}#status{font-weight:600}
 <p id="status" role="status">Not connected</p>
 <p>Volume <input type="range" id="volume" min="0" max="100" value="85" aria-label="Volume"></p>
 <p>Playback speed <select id="speed" aria-label="Playback speed"><option value="1">1.0× Natural</option><option value="1.1" selected>1.1× Slightly faster</option><option value="1.2">1.2× Faster</option><option value="1.3">1.3× Fast</option></select></p>
-<h2>English interpretation</h2><div id="caption" aria-live="polite">English translation will appear here.</div>
+<h2>English interpretation</h2><div id="caption" aria-live="polite">English audio has not started.</div>
+<p class="muted" id="captionNote">Text shown here follows the playback position, not the newest translation.</p>
+<p class="muted" id="latestText">Newest translation: waiting…</p>
 <h2>Live Telugu recognition</h2><div id="teluguLive" style="background:#f0f6f1;padding:16px;border-radius:12px;min-height:70px;font-size:21px" aria-live="polite">Waiting for speech…</div>
 <small id="details" class="muted"></small>
 <p id="diagnostics" class="muted" aria-live="polite">Audio diagnostics: not connected</p>
-<p class="muted">Use headphones. Keep this page open and your screen awake. New listeners hear future speech only. Finalized phrases preserve more context, but may arrive after a pause. The browser schedules up to 60 seconds ahead; later received phrases wait in order. This does not fix speech lost before reaching the phone.</p>
+<p class="muted">Use headphones. Keep this page open and your screen awake. New listeners hear future speech only. Recognition sometimes emits 1–3 word clips and may pause before the next phrase. Queue underruns indicate no English audio remains to play; they do not prove the browser dropped any speech. The browser schedules up to 60 seconds ahead; later received phrases wait in order. This does not fix speech lost before reaching the phone.</p>
 </main><script>
 const $=id=>document.getElementById(id);
 let ws=null,ctx=null,gain=null,epoch=0,nextTime=0;
 const MAX_SCHEDULED_SECONDS=60;
 let chain=Promise.resolve(),received=0,scheduled=0,skipped=0,failed=0,lastError='',lastSeq=0;
 let pending=[],pendingSeconds=0,sequenceGaps=0,overLimitEvents=0,drainTimer=null;
+let audibleStarts=0,audibleEnds=0,queueUnderruns=0,firstAudio=false;
+let expectedSeq=null,lastPacketAt=0,lastPlaybackAt=0,lastFinishAt=0;
+let scheduledItems=[];
 const status=s=>$('status').textContent=s;
 function report(){
   const state=ctx?ctx.state:'none';
   const backlog=ctx?Math.max(0,nextTime-ctx.currentTime):0;
-  $('diagnostics').textContent='Audio: '+state+' | received '+received+' | scheduled '+scheduled+
-    ' | browser skips '+skipped+' | errors '+failed+' | packet gaps '+sequenceGaps+
-    ' | scheduled '+backlog.toFixed(1)+'/60s | waiting '+pendingSeconds.toFixed(1)+'s'+
-    ' | buffer overflows '+overLimitEvents+(lastError?' | '+lastError:'');
+  const now=Date.now(),lastPacketAge=lastPacketAt?((now-lastPacketAt)/1000).toFixed(1)+'s':'none';
+  const lastPlaybackAge=lastPlaybackAt?((now-lastPlaybackAt)/1000).toFixed(1)+'s':'none';
+  $('diagnostics').textContent='Audio: '+state+' | packets '+received+
+    ' | scheduled '+scheduled+' | started '+audibleStarts+' | ended '+audibleEnds+
+    ' | underruns '+queueUnderruns+' | errors '+failed+' | packet gaps '+sequenceGaps+
+    ' | queue '+backlog.toFixed(1)+'/60s + waiting '+pendingSeconds.toFixed(1)+'s'+
+    ' | last packet '+lastPacketAge+' ago | last audio start '+lastPlaybackAge+
+    ' ago'+(lastError?' | '+lastError:'');
 }
 function cleanup(){
   epoch++; if(drainTimer){clearInterval(drainTimer);drainTimer=null}
@@ -44,6 +53,10 @@ function cleanup(){
   gain=null;nextTime=0;chain=Promise.resolve();
   received=scheduled=skipped=failed=lastSeq=sequenceGaps=overLimitEvents=0;
   pending=[];pendingSeconds=0;lastError='';
+  audibleStarts=audibleEnds=queueUnderruns=0;firstAudio=false;
+  expectedSeq=null;lastPacketAt=lastPlaybackAt=lastFinishAt=0;scheduledItems=[];
+  $('caption').textContent='English audio has not started.';
+  $('latestText').textContent='Newest translation: waiting…';
   $('join').disabled=false;$('leave').disabled=true;$('unlock').disabled=true;
   report();
 }
@@ -57,26 +70,48 @@ async function audioReady(){
 }
 // A 60-second *scheduled* playback window; overflow stays in a FIFO waiting
 // queue instead of being silently dropped. All speech remains in order.
+function tickPlayback(myEpoch){
+  if(myEpoch!==epoch||!ctx)return;
+  const t=ctx.currentTime;
+  while(scheduledItems.length && scheduledItems[0].when<=t+0.012){
+    const item=scheduledItems.shift();
+    audibleStarts++;lastPlaybackAt=Date.now();
+    $('caption').textContent=item.english||'(test audio)';
+    $('details').textContent='Audio segment '+item.seq+' started (browser clock)';
+  }
+  drainAudio(myEpoch);
+}
 function drainAudio(myEpoch){
   if(myEpoch!==epoch||!ctx||ctx.state!=='running')return;
   while(pending.length){
-    const item=pending[0];
-    const rate=Number($('speed').value)||1;
+    const item=pending[0],rate=Number($('speed').value)||1;
     const duration=item.buffer.duration/rate;
     const backlog=Math.max(0,nextTime-ctx.currentTime);
-    // Allow one long individual clip if necessary to prevent starvation.
-    if(backlog>0 && backlog+duration>MAX_SCHEDULED_SECONDS)break;
+    if(backlog>0&&backlog+duration>MAX_SCHEDULED_SECONDS)break;
     pending.shift();pendingSeconds=Math.max(0,pendingSeconds-item.buffer.duration);
     const source=ctx.createBufferSource();
     source.buffer=item.buffer;source.playbackRate.value=rate;source.connect(gain);
-    const when=Math.max(ctx.currentTime+0.03,nextTime);
-    source.start(when);nextTime=when+duration;scheduled++;
+    // A small future margin avoids the 30ms extra gap added to every
+    // packet when the previous packet is already scheduled to end.
+    const when=Math.max(ctx.currentTime+0.008,nextTime);
+    source.onended=()=>{
+      if(myEpoch!==epoch)return;
+      audibleEnds++;lastFinishAt=Date.now();report();
+    };
+    source.start(when);
+    nextTime=when+duration;scheduled++;
+    scheduledItems.push({...item,when});
+    firstAudio=true;
   }
-  const backlog=Math.max(0,nextTime-ctx.currentTime);
-  if(backlog>8||pending.length){
-    status('Audio delayed: '+backlog.toFixed(1)+'s scheduled, '+pending.length+
-           ' phrases waiting; no browser backlog skipping.');
-  }
+  if(firstAudio&&ctx.currentTime>=nextTime&&pending.length===0&&scheduledItems.length===0){
+    // Count the transition to empty only once per completed audio run.
+    if(lastFinishAt && !drainAudio.reportedEmpty){
+      queueUnderruns++;drainAudio.reportedEmpty=true;
+      status('Waiting for the next translated phrase (playback queue empty).');
+    }
+  }else if(nextTime>ctx.currentTime||pending.length)drainAudio.reportedEmpty=false;
+  if(ctx.state==='running'&&(Math.max(0,nextTime-ctx.currentTime)>8||pending.length))
+    status('English audio delayed; all received phrases remain queued.');
   report();
 }
 async function playPacket(msg,myEpoch){
@@ -94,7 +129,7 @@ async function playPacket(msg,myEpoch){
     }
     const backlog=Math.max(0,nextTime-ctx.currentTime);
     if(backlog+pendingSeconds+buffer.duration>MAX_SCHEDULED_SECONDS)overLimitEvents++;
-    pending.push({buffer,seq:msg.seq});
+    pending.push({buffer,seq:msg.seq,english:msg.english||'',telugu:msg.telugu||''});
     pendingSeconds+=buffer.duration;
     drainAudio(myEpoch);
     report();
@@ -110,7 +145,7 @@ $('unlock').onclick=async()=>{
     osc.frequency.value=660;amp.gain.value=0.08;
     osc.connect(amp);amp.connect(ctx.destination);
     osc.start();osc.stop(ctx.currentTime+0.18);
-    lastError='';status('Audio resumed; test beep triggered');drainAudio(epoch);report();
+    lastError='';status('Audio resumed; test beep triggered');tickPlayback(epoch);report();
   }catch(e){lastError='Resume failed: '+e.message;report()}
 };
 $('join').onclick=async()=>{
@@ -124,7 +159,7 @@ $('join').onclick=async()=>{
     const myEpoch=epoch;
     ctx.onstatechange=()=>{if(myEpoch===epoch)report()};
     $('join').disabled=true;$('leave').disabled=false;$('unlock').disabled=false;
-    drainTimer=setInterval(()=>drainAudio(myEpoch),500);
+    drainTimer=setInterval(()=>tickPlayback(myEpoch),100);
     ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
     status('Connecting…');report();
     ws.onopen=()=>ws.send(JSON.stringify({type:'auth',code}));
@@ -135,17 +170,15 @@ $('join').onclick=async()=>{
       if(msg.type==='warning'){status(msg.message);return}
       if(msg.type==='partial'){$('teluguLive').textContent=msg.telugu||'';return}
       if(msg.type==='caption'){
-        $('caption').textContent=msg.english??'';
-        $('details').textContent='English caption '+msg.seq;return;
+        $('latestText').textContent='Newest translation #'+msg.seq+': '+(msg.english??'');return;
       }
       if(msg.type!=='segment')return;
-      received++;
+      received++;lastPacketAt=Date.now();
       if(lastSeq && Number.isInteger(msg.seq) && msg.seq>lastSeq+1){
         sequenceGaps+=msg.seq-lastSeq-1;
       }
       if(Number.isInteger(msg.seq))lastSeq=msg.seq;
       report();
-      $('caption').textContent=msg.english??'';
       // An ordered chain avoids out-of-order decoding/scheduling.
       chain=chain.then(()=>playPacket(msg,myEpoch)).catch(e=>{
         failed++;lastError='Audio queue: '+e.message;report();
@@ -160,6 +193,6 @@ $('join').onclick=async()=>{
 };
 $('leave').onclick=()=>{cleanup();status('Disconnected')};
 document.addEventListener('visibilitychange',()=>{
-  if(!document.hidden&&ctx){audioReady();drainAudio(epoch);report()}
+  if(!document.hidden&&ctx){audioReady();tickPlayback(epoch);report()}
 });
 </script></body></html>
