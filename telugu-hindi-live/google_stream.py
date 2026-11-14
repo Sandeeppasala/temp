@@ -64,11 +64,36 @@ class GoogleMicrophone:
                                            dtype="int16", blocksize=3200,
                                            callback=callback):
                         def chunks():
+                            # Google closes the stream if no audio arrives for
+                            # several seconds, even when nobody is speaking.
+                            # Send REAL microphone silence normally; use a
+                            # paced silent placeholder only if capture stalls.
+                            # This keeps the RPC healthy but is NOT a
+                            # replacement for microphone audio lost in a stall.
+                            block_seconds = 3200 / 16000
+                            silent_block = bytes(3200 * 2)
+                            last_capture = time.monotonic()
+                            last_warning = 0.0
                             while not self.stop_event.is_set() and time.monotonic() - started < 235:
                                 try:
-                                    block = audio.get(timeout=0.2)
+                                    block = audio.get(timeout=block_seconds)
+                                    last_capture = time.monotonic()
                                 except queue.Empty:
-                                    continue
+                                    block = silent_block
+                                    missing_for = time.monotonic() - last_capture
+                                    if missing_for >= 2.0 and time.monotonic() - last_warning >= 5.0:
+                                        log.error("Microphone capture stalled for %.1fs; "
+                                                  "sending silence to keep Google stream alive. "
+                                                  "Speech may be missing.", missing_for)
+                                        self.on_error("Microphone capture stalled; some speech may be missing")
+                                        last_warning = time.monotonic()
+                                # Don't burst accumulated queued PCM faster
+                                # than it was captured; Google expects real-time pace.
+                                target = getattr(chunks, "last_send", 0.0) + block_seconds
+                                delay = target - time.monotonic()
+                                if 0 < delay < block_seconds:
+                                    self.stop_event.wait(delay)
+                                chunks.last_send = time.monotonic()
                                 yield speech.StreamingRecognizeRequest(audio_content=block)
                         responses = client.streaming_recognize(
                             config=stream_config, requests=chunks(), timeout=260)
