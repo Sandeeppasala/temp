@@ -1,6 +1,6 @@
 <!doctype html>
-<html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hindi Live Interpretation</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>English Live Interpretation</title>
 <style>
 body{margin:0;background:#f4f7fa;color:#16233b;font:16px system-ui,sans-serif}
 main{max-width:620px;margin:32px auto;padding:25px;background:white;border-radius:18px;box-shadow:0 5px 25px #17314a16}
@@ -10,13 +10,13 @@ button{border:0;background:#1b6bba;color:white;cursor:pointer}button:disabled{op
 #caption{background:#eaf2fb;padding:16px;border-radius:12px;min-height:70px;font-size:22px}
 small{display:block;margin-top:8px}#status{font-weight:600}
 </style></head><body><main>
-<h1>🎧 Hindi Live</h1><p class="muted">Telugu → Hindi • Live interpretation for workshop attendees</p>
+<h1>🎧 English Live</h1><p class="muted">Telugu → English • Live interpretation for workshop attendees</p>
 <label for="code">Event access code</label>
 <div class="row"><input id="code" type="password" autocomplete="off" placeholder="Enter event code">
 <button id="join">Start Listening</button><button id="leave" disabled>Leave</button></div>
 <p id="status" role="status">Not connected</p>
 <p>Volume <input type="range" id="volume" min="0" max="100" value="85" aria-label="Volume"></p>
-<h2>हिंदी अनुवाद</h2><div id="caption" aria-live="polite">अनुवाद यहाँ दिखाई देगा।</div>
+<h2>English interpretation</h2><div id="caption" aria-live="polite">English translation will appear here.</div>
 <small id="details" class="muted"></small>
 <p class="muted">Use headphones. Keep this page open and your screen awake. New listeners hear future speech only. Translation may be delayed or imperfect.</p>
 </main><script>
@@ -48,7 +48,7 @@ $('join').onclick=async()=>{
       if(msg.type==='status'){connected=true;status(msg.running?'Connected • translation live':'Connected • waiting for speaker');return}
       if(msg.type==='warning'){status(msg.message);return}
       if(msg.type!=='segment')return;
-      $('caption').textContent=msg.hindi;
+      $('caption').textContent=msg.english ?? '';
       $('details').textContent='Segment '+msg.seq+(msg.telugu?' • Telugu: '+msg.telugu:'');
       // decodeAudioData may complete out of order. Reserve scheduling in arrival order.
       const raw=atob(msg.audio), bytes=new Uint8Array(raw.length);

@@ -1,4 +1,4 @@
-"""Laptop-hosted Telugu → Hindi interpreter with authorized browser listeners.
+"""Laptop-hosted Telugu → English interpreter with authorized browser listeners.
 
 Start with: python -m uvicorn app:app --host 127.0.0.1 --port 8000
 Run from this project directory. Never expose the admin key to listeners.
@@ -21,11 +21,14 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("interpreter")
 HERE = Path(__file__).resolve().parent
-app = FastAPI(title="Telugu → Hindi Live")
+app = FastAPI(title="Telugu → English Live")
 event_code = os.getenv("EVENT_CODE", "")
 admin_key = os.getenv("ADMIN_KEY", "")
 max_listeners = int(os.getenv("MAX_LISTENERS", "25"))
 provider = os.getenv("TRANSLATION_PROVIDER", "azure").strip().lower()
+# English output is currently supported by Azure; Sarvam remains Hindi-only.
+TARGET_LANGUAGE = "en"
+ENGLISH_VOICE = os.getenv("ENGLISH_VOICE", "en-US-JennyNeural")
 sarvam_session = None
 control_lock = asyncio.Lock()
 loop: Optional[asyncio.AbstractEventLoop] = None
@@ -97,7 +100,7 @@ def recognition_callback(evt) -> None:
         return
     if evt.result.reason != speechsdk.ResultReason.TranslatedSpeech:
         return
-    text = (evt.result.translations or {}).get("hi", "").strip()
+    text = (evt.result.translations or {}).get(TARGET_LANGUAGE, "").strip()
     telugu = (evt.result.text or "").strip()
     if not text:
         return
@@ -113,17 +116,17 @@ def canceled_callback(evt) -> None:
     log.error("Azure recognition canceled: %s", getattr(evt, "reason", "unknown"))
 
 
-def synthesize_hindi(text: str) -> bytes:
+def synthesize_english(text: str) -> bytes:
     cfg = speechsdk.SpeechConfig(
         subscription=os.environ["AZURE_SPEECH_KEY"],
         region=os.environ["AZURE_SPEECH_REGION"])
-    cfg.speech_synthesis_voice_name = os.getenv("HINDI_VOICE", "hi-IN-SwaraNeural")
+    cfg.speech_synthesis_voice_name = ENGLISH_VOICE
     cfg.set_speech_synthesis_output_format(
         speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm)
     synth = speechsdk.SpeechSynthesizer(speech_config=cfg, audio_config=None)
     result = synth.speak_text_async(text).get()
     if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
-        raise RuntimeError("Hindi speech synthesis failed: " + str(result.reason))
+        raise RuntimeError("English speech synthesis failed: " + str(result.reason))
     return bytes(result.audio_data)
 
 
@@ -139,11 +142,11 @@ async def translation_worker() -> None:
             if not hindi:
                 continue
             audio = await asyncio.to_thread(
-                hindi_audio if provider == "sarvam" else synthesize_hindi, hindi)
+                hindi_audio if provider == "sarvam" else synthesize_english, hindi)
             sequence += 1
             await publish({
                 "type": "segment", "seq": sequence,
-                "telugu": telugu, "hindi": hindi,
+                "telugu": telugu, "english": hindi,
                 "mime": "audio/wav", "audio": base64.b64encode(audio).decode("ascii")
             })
         except asyncio.CancelledError:
@@ -201,7 +204,8 @@ def status(x_admin_key: str | None = Header(default=None)):
     admin_auth(x_admin_key)
     return {"running": running, "listeners": len(clients),
             "azure_configured": azure_configured(),
-            "provider": provider, "provider_configured": configured()}
+            "provider": provider, "target_language": TARGET_LANGUAGE,
+            "voice": ENGLISH_VOICE, "provider_configured": configured()}
 
 
 @app.post("/api/start")
@@ -213,8 +217,8 @@ async def start(x_admin_key: str | None = Header(default=None)):
             return {"running": True, "provider": provider}
         if not event_code or event_code == admin_key:
             raise HTTPException(400, "Set distinct EVENT_CODE and ADMIN_KEY in .env")
-        if provider not in ("azure", "sarvam"):
-            raise HTTPException(400, "TRANSLATION_PROVIDER must be azure or sarvam")
+        if provider != "azure":
+            raise HTTPException(400, "Telugu-to-English mode requires TRANSLATION_PROVIDER=azure")
         if not configured():
             raise HTTPException(400, f"Configure {provider} API credentials in .env")
         if sarvam_session:
@@ -232,7 +236,7 @@ async def start(x_admin_key: str | None = Header(default=None)):
                     subscription=os.environ["AZURE_SPEECH_KEY"],
                     region=os.environ["AZURE_SPEECH_REGION"])
                 cfg.speech_recognition_language = "te-IN"
-                cfg.add_target_language("hi")
+                cfg.add_target_language(TARGET_LANGUAGE)
                 mic = speechsdk.audio.AudioConfig(use_default_microphone=True)
                 recognizer = speechsdk.translation.TranslationRecognizer(
                     translation_config=cfg, audio_config=mic)
@@ -295,7 +299,9 @@ async def test_voice(x_admin_key: str | None = Header(default=None)):
     admin_auth(x_admin_key)
     if not configured():
         raise HTTPException(400, f"Configure {provider} credentials first")
-    hindi = "नमस्ते। हिंदी अनुवाद की ध्वनि परीक्षण सफल रहा।"
+    if provider != "azure":
+        raise HTTPException(400, "English voice test requires TRANSLATION_PROVIDER=azure")
+    hindi = "Hello. The English translation audio test was successful."
     try:
         audio = await asyncio.to_thread(
             hindi_audio if provider == "sarvam" else synthesize_hindi, hindi)
@@ -303,7 +309,7 @@ async def test_voice(x_admin_key: str | None = Header(default=None)):
         raise HTTPException(502, f"Audio test failed: {exc}") from exc
     sequence += 1
     await publish({"type": "segment", "seq": sequence, "telugu": "",
-                   "hindi": hindi, "mime": "audio/wav",
+                   "english": hindi, "mime": "audio/wav",
                    "audio": base64.b64encode(audio).decode("ascii")})
     return {"sent": True, "listeners": len(clients), "provider": provider}
 

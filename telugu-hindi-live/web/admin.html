@@ -6,12 +6,12 @@ input,button{font:inherit;padding:12px;border-radius:8px;margin:6px;border:1px s
 input{width:70%}button{cursor:pointer;background:#155fa5;color:white;border:0}
 p{line-height:1.5}code{background:#edf1f5;padding:2px 5px}
 </style></head><body><main>
-<h1>🎙️ Translation Control</h1>
+<h1>🎙️ Telugu → English Translation Control</h1>
 <p>Run this page on your laptop. The Windows default microphone is sent to Azure only while translation is running.</p>
 <label>Administrator key <input id="key" type="password" autocomplete="off"></label>
 <div><button onclick="call('/api/start')">Start microphone</button>
 <button onclick="call('/api/stop')">Stop microphone</button>
-<button onclick="call('/api/test')">Send test Hindi voice</button>
+<button onclick="call('/api/test')">Send test English voice</button>
 <button onclick="refresh()">Status</button></div>
 <pre id="output" aria-live="polite">Ready</pre>
 <p><strong>Participant link:</strong> <a href="/" target="_blank" rel="noopener" id="link">Open listener page</a></p>
