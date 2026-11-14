@@ -4,3 +4,4 @@ azure-cognitiveservices-speech>=1.42,<2
 python-dotenv>=1.0,<2
 sarvamai>=0.1
 sounddevice>=0.5,<1
+google-cloud-speech>=2.26,<3

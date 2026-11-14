@@ -16,6 +16,8 @@ from urllib import request as urlrequest
 from urllib import error as urlerror
 
 import azure.cognitiveservices.speech as speechsdk
+from google_stream import GoogleMicrophone
+from google_tts import google_english_audio
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -28,7 +30,7 @@ app = FastAPI(title="Telugu → English Live")
 event_code = os.getenv("EVENT_CODE", "")
 admin_key = os.getenv("ADMIN_KEY", "")
 max_listeners = int(os.getenv("MAX_LISTENERS", "25"))
-provider = os.getenv("TRANSLATION_PROVIDER", "azure").strip().lower()
+provider = os.getenv("TRANSLATION_PROVIDER", "google").strip().lower()
 # Google Cloud Translation Basic converts recognized Telugu text to English.
 TARGET_LANGUAGE = "en"
 GOOGLE_TRANSLATE_KEY = os.getenv("GOOGLE_TRANSLATE_API_KEY", "").strip()
@@ -38,6 +40,7 @@ loop: Optional[asyncio.AbstractEventLoop] = None
 clients: set[WebSocket] = set()
 running = False
 recognizer = None
+google_mic = None
 translation_queue: asyncio.Queue | None = None
 worker_task: asyncio.Task | None = None
 sequence = 0
@@ -63,7 +66,7 @@ def google_configured() -> bool:
 
 
 def configured() -> bool:
-    return provider == "azure" and azure_configured() and google_configured()
+    return google_configured() and (provider == "google" or (provider == "azure" and azure_configured()))
 
 
 def google_translate_english(telugu: str) -> str:
@@ -126,6 +129,24 @@ def recognition_callback(evt) -> None:
     loop.call_soon_threadsafe(enqueue)
 
 
+def google_recognized(telugu: str) -> None:
+    if not running or loop is None or translation_queue is None:
+        return
+    def enqueue():
+        if running and translation_queue and not translation_queue.full():
+            translation_queue.put_nowait(telugu)
+        else:
+            log.warning("Google translation queue full; dropping phrase")
+    loop.call_soon_threadsafe(enqueue)
+
+
+def google_failed(message: str) -> None:
+    log.error("%s", message)
+    if loop is not None:
+        loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(publish({"type": "warning", "message": message})))
+
+
 def canceled_callback(evt) -> None:
     log.error("Azure recognition canceled: %s", getattr(evt, "reason", "unknown"))
 
@@ -154,7 +175,7 @@ async def translation_worker() -> None:
             english = await asyncio.to_thread(google_translate_english, telugu)
             if not english:
                 continue
-            audio = await asyncio.to_thread(synthesize_english, english)
+            audio = await asyncio.to_thread(google_english_audio if provider == 'google' else synthesize_english, english)
             sequence += 1
             await publish({
                 "type": "segment", "seq": sequence,
@@ -180,8 +201,11 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global running, recognizer, worker_task
+    global running, recognizer, worker_task, google_mic
     running = False
+    if google_mic:
+        await asyncio.to_thread(google_mic.stop)
+        google_mic = None
     if recognizer:
         await asyncio.to_thread(lambda: recognizer.stop_continuous_recognition_async().get())
         recognizer = None
@@ -215,40 +239,48 @@ def status(x_admin_key: str | None = Header(default=None)):
             "azure_configured": azure_configured(),
             "google_configured": google_configured(),
             "translation_engine": "google-cloud-translation-v2",
-            "provider": provider, "target_language": TARGET_LANGUAGE,
+            "provider": provider, "speech_engine": provider, "tts_engine": provider,
+            "target_language": TARGET_LANGUAGE,
             "voice": ENGLISH_VOICE, "provider_configured": configured()}
 
 
 @app.post("/api/start")
 async def start(x_admin_key: str | None = Header(default=None)):
-    global running, recognizer, translation_queue, worker_task
+    global running, recognizer, translation_queue, worker_task, google_mic
     admin_auth(x_admin_key)
     async with control_lock:
         if running:
             return {"running": True, "provider": provider}
         if not event_code or event_code == admin_key:
             raise HTTPException(400, "Set distinct EVENT_CODE and ADMIN_KEY in .env")
-        if provider != "azure":
-            raise HTTPException(400, "Set TRANSLATION_PROVIDER=azure (Azure STT and English TTS)")
+        if provider not in ("azure", "google"):
+            raise HTTPException(400, "Set TRANSLATION_PROVIDER=google or azure")
         if not configured():
-            raise HTTPException(400, "Configure Azure Speech key/region and GOOGLE_TRANSLATE_API_KEY in .env")
+            raise HTTPException(400, "Configure Google Translation key and Azure credentials if using fallback")
         translation_queue = asyncio.Queue(maxsize=12)
         worker_task = asyncio.create_task(translation_worker())
         running = True
         try:
-            cfg = speechsdk.SpeechConfig(
-                subscription=os.environ["AZURE_SPEECH_KEY"],
-                region=os.environ["AZURE_SPEECH_REGION"])
-            cfg.speech_recognition_language = "te-IN"
-            mic = speechsdk.audio.AudioConfig(use_default_microphone=True)
-            recognizer = speechsdk.SpeechRecognizer(
-                speech_config=cfg, audio_config=mic)
-            recognizer.recognized.connect(recognition_callback)
-            recognizer.canceled.connect(canceled_callback)
-            await asyncio.to_thread(
-                lambda: recognizer.start_continuous_recognition_async().get())
+            if provider == "google":
+                google_mic = GoogleMicrophone(google_recognized, google_failed)
+                google_mic.start()
+            else:
+                cfg = speechsdk.SpeechConfig(
+                    subscription=os.environ["AZURE_SPEECH_KEY"],
+                    region=os.environ["AZURE_SPEECH_REGION"])
+                cfg.speech_recognition_language = "te-IN"
+                mic = speechsdk.audio.AudioConfig(use_default_microphone=True)
+                recognizer = speechsdk.SpeechRecognizer(
+                    speech_config=cfg, audio_config=mic)
+                recognizer.recognized.connect(recognition_callback)
+                recognizer.canceled.connect(canceled_callback)
+                await asyncio.to_thread(
+                    lambda: recognizer.start_continuous_recognition_async().get())
         except Exception as exc:
             running = False
+            if google_mic:
+                await asyncio.to_thread(google_mic.stop)
+                google_mic = None
             if worker_task:
                 worker_task.cancel()
                 try:
@@ -265,10 +297,13 @@ async def start(x_admin_key: str | None = Header(default=None)):
 
 @app.post("/api/stop")
 async def stop(x_admin_key: str | None = Header(default=None)):
-    global running, recognizer, worker_task, translation_queue
+    global running, recognizer, worker_task, translation_queue, google_mic
     admin_auth(x_admin_key)
     async with control_lock:
         running = False
+        if google_mic:
+            await asyncio.to_thread(google_mic.stop)
+            google_mic = None
         if recognizer:
             await asyncio.to_thread(
                 lambda: recognizer.stop_continuous_recognition_async().get())
@@ -294,13 +329,11 @@ async def stop(x_admin_key: str | None = Header(default=None)):
 async def test_voice(x_admin_key: str | None = Header(default=None)):
     global sequence
     admin_auth(x_admin_key)
-    if not azure_configured():
-        raise HTTPException(400, "Configure Azure Speech credentials first")
-    if provider != "azure":
-        raise HTTPException(400, "English voice test requires TRANSLATION_PROVIDER=azure")
+    if not configured():
+        raise HTTPException(400, "Configure credentials for selected provider first")
     english = "Hello. The English translation audio test was successful."
     try:
-        audio = await asyncio.to_thread(synthesize_english, english)
+        audio = await asyncio.to_thread(google_english_audio if provider == 'google' else synthesize_english, english)
     except Exception as exc:
         raise HTTPException(502, f"Audio test failed: {exc}") from exc
     sequence += 1
