@@ -5,7 +5,7 @@
 body{margin:0;background:#f4f7fa;color:#16233b;font:16px system-ui,sans-serif}
 main{max-width:620px;margin:32px auto;padding:25px;background:white;border-radius:18px;box-shadow:0 5px 25px #17314a16}
 h1{margin:0 0 8px;font-size:28px}.muted{color:#546579}.row{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}
-input,button{font:inherit;padding:12px;border-radius:9px}input{flex:1;min-width:150px;border:1px solid #b9c7d4}
+input,button,select{font:inherit;padding:12px;border-radius:9px}input{flex:1;min-width:150px;border:1px solid #b9c7d4}
 button{border:0;background:#1b6bba;color:white;cursor:pointer}button:disabled{opacity:.55}
 #caption{background:#eaf2fb;padding:16px;border-radius:12px;min-height:70px;font-size:22px}
 small{display:block;margin-top:8px}#status{font-weight:600}
@@ -16,6 +16,8 @@ small{display:block;margin-top:8px}#status{font-weight:600}
 <button id="join">Start Listening</button><button id="leave" disabled>Leave</button></div>
 <p id="status" role="status">Not connected</p>
 <p>Volume <input type="range" id="volume" min="0" max="100" value="85" aria-label="Volume"></p>
+<p>English playback speed <select id="speed" aria-label="English playback speed"><option value="1">Normal (1.0×)</option><option value="1.15">Faster (1.15×)</option><option value="1.25" selected>Faster (1.25×)</option><option value="1.4">Fast (1.4×)</option></select></p>
+<p class="muted" id="latency">Latency: waiting for first translation</p>
 <h2>English interpretation</h2><div id="caption" aria-live="polite">English translation will appear here.</div>
 <p class="muted">Live Telugu recognition (preliminary): <span id="teluguLive">Waiting for speech…</span></p>
 <small id="details" class="muted"></small>
@@ -23,10 +25,11 @@ small{display:block;margin-top:8px}#status{font-weight:600}
 </main><script>
 const $=id=>document.getElementById(id);
 let ws=null, ctx=null, gain=null, nextTime=0, connected=false, epoch=0;
+let audioChain=Promise.resolve(), skipped=0;
 const status=s=>$('status').textContent=s;
 function cleanup(){
   connected=false; epoch++; if(ws){ws.onclose=null;ws.close();ws=null}
-  if(ctx){ctx.close();ctx=null} gain=null;nextTime=0;
+  if(ctx){ctx.close();ctx=null} gain=null;nextTime=0;audioChain=Promise.resolve();skipped=0;
   $('join').disabled=false;$('leave').disabled=true;
 }
 $('volume').oninput=()=>{if(gain)gain.gain.value=Number($('volume').value)/100};
@@ -49,29 +52,45 @@ $('join').onclick=async()=>{
       if(msg.type==='status'){connected=true;status(msg.running?'Connected • translation live':'Connected • waiting for speaker');return}
       if(msg.type==='warning'){status(msg.message);return}
       if(msg.type==='partial'){$('teluguLive').textContent=msg.telugu || '';return}
+      if(msg.type==='caption'){
+        $('caption').textContent=msg.english ?? '';
+        $('details').textContent='Translated segment '+msg.seq+(msg.telugu?' • Telugu: '+msg.telugu:'');
+        return;
+      }
       if(msg.type!=='segment')return;
       $('caption').textContent=msg.english ?? '';
-      $('details').textContent='Segment '+msg.seq+(msg.telugu?' • Telugu: '+msg.telugu:'');
+      if(msg.timing){
+        const t=msg.timing;
+        $('latency').textContent='Server: '+t.total_s+'s (queued '+t.queue_wait_s+'s, translated '+t.translate_s+'s, voice '+t.tts_s+'s) • '+t.dropped+' server drops';
+      }
+      $('details').textContent='Audio segment '+msg.seq;
       // decodeAudioData may complete out of order. Reserve scheduling in arrival order.
       const raw=atob(msg.audio), bytes=new Uint8Array(raw.length);
       for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);
+      // Serialize decoding to preserve speaker order even if audio decodes at different speeds.
+      audioChain=audioChain.then(async()=>{
       try{
         const buffer=await ctx.decodeAudioData(bytes.buffer);
         if(myEpoch!==epoch)return;
         const source=ctx.createBufferSource();source.buffer=buffer;source.connect(gain);
+        const playbackRate=Number($('speed').value)||1;
+        source.playbackRate.value=playbackRate;
         // Don't extend a long queue with stale audio. Keep the current stream
         // close to live, at the expense of possibly skipping a phrase.
         const delay=Math.max(0,nextTime-ctx.currentTime);
         if(delay>12){
-          status('Live audio falling behind; skipping an older translated phrase.');
+          skipped++;
+          status('Playback behind '+delay.toFixed(1)+'s; skipped '+skipped+' phrase(s).');
           return;
         }
         const when=Math.max(ctx.currentTime+0.1,nextTime);
-        source.start(when);nextTime=when+buffer.duration;
+        source.start(when);nextTime=when+buffer.duration/playbackRate;
+        $('latency').textContent+=' • phone queued '+Math.max(0,nextTime-ctx.currentTime).toFixed(1)+'s • skipped '+skipped;
         if(nextTime-ctx.currentTime>8){
           status('Audio is several seconds behind. Playback is catching up.');
         }
       }catch(e){status('Audio playback problem: '+e.message)}
+      }).catch(e=>status('Audio queue problem: '+e.message));
     };
     ws.onclose=ev=>{
       if(myEpoch!==epoch)return;

@@ -10,6 +10,7 @@ import html
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Optional
 from urllib import request as urlrequest
@@ -44,6 +45,7 @@ google_mic = None
 translation_queue: asyncio.Queue | None = None
 worker_task: asyncio.Task | None = None
 sequence = 0
+metrics = {"queue_wait_s": 0.0, "translate_s": 0.0, "tts_s": 0.0, "total_s": 0.0, "dropped": 0, "processed": 0}
 
 
 def check_secret(given: str, expected: str) -> bool:
@@ -123,8 +125,9 @@ def recognition_callback(evt) -> None:
         return
     def enqueue():
         if running and translation_queue and not translation_queue.full():
-            translation_queue.put_nowait(telugu)
+            translation_queue.put_nowait((telugu, time.monotonic()))
         else:
+            metrics["dropped"] += 1
             log.warning("Translation backlog full: dropping segment")
     loop.call_soon_threadsafe(enqueue)
 
@@ -136,6 +139,7 @@ def google_recognized(telugu: str) -> None:
         if running and translation_queue and not translation_queue.full():
             translation_queue.put_nowait(telugu)
         else:
+            metrics["dropped"] += 1
             log.warning("Google translation queue full; dropping phrase")
     loop.call_soon_threadsafe(enqueue)
 
@@ -176,19 +180,34 @@ async def translation_worker() -> None:
     global sequence
     assert translation_queue is not None
     while True:
-        telugu = await translation_queue.get()
+        telugu, received_at = await translation_queue.get()
         try:
-            # A single worker preserves utterance ordering for all listeners.
+            metrics["queue_wait_s"] = round(time.monotonic() - received_at, 2)
+            started = time.monotonic()
             english = await asyncio.to_thread(google_translate_english, telugu)
+            metrics["translate_s"] = round(time.monotonic() - started, 2)
             if not english:
                 continue
-            audio = await asyncio.to_thread(google_english_audio if provider == 'google' else synthesize_english, english)
             sequence += 1
+            seq = sequence
+            # Show English captions immediately; don't wait for audio synthesis.
+            await publish({"type": "caption", "seq": seq,
+                           "telugu": telugu, "english": english})
+            tts_start = time.monotonic()
+            audio = await asyncio.to_thread(
+                google_english_audio if provider == 'google' else synthesize_english, english)
+            metrics["tts_s"] = round(time.monotonic() - tts_start, 2)
+            metrics["total_s"] = round(time.monotonic() - received_at, 2)
+            metrics["processed"] += 1
             await publish({
-                "type": "segment", "seq": sequence,
+                "type": "segment", "seq": seq,
                 "telugu": telugu, "english": english,
+                "timing": dict(metrics),
                 "mime": "audio/wav", "audio": base64.b64encode(audio).decode("ascii")
             })
+            log.info("Segment %s: queue %.2fs, translation %.2fs, TTS %.2fs, total %.2fs",
+                     seq, metrics["queue_wait_s"], metrics["translate_s"],
+                     metrics["tts_s"], metrics["total_s"])
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -248,7 +267,8 @@ def status(x_admin_key: str | None = Header(default=None)):
             "translation_engine": "google-cloud-translation-v2",
             "provider": provider, "speech_engine": provider, "tts_engine": provider,
             "target_language": TARGET_LANGUAGE,
-            "voice": ENGLISH_VOICE, "provider_configured": configured()}
+            "voice": ENGLISH_VOICE, "provider_configured": configured(),
+            "metrics": dict(metrics), "queued_phrases": translation_queue.qsize() if translation_queue else 0}
 
 
 @app.post("/api/start")
