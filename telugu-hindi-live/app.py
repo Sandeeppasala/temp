@@ -137,7 +137,7 @@ def google_recognized(telugu: str) -> None:
         return
     def enqueue():
         if running and translation_queue and not translation_queue.full():
-            translation_queue.put_nowait(telugu)
+            translation_queue.put_nowait((telugu, time.monotonic()))
         else:
             metrics["dropped"] += 1
             log.warning("Google translation queue full; dropping phrase")
