@@ -1,13 +1,13 @@
-"""Validate microphone stream pacing/fallback syntax without cloud credentials.
-Run: python test_audio_stream_contract.py
-"""
+"""Static checks for no synthetic audio; run with local Python."""
 import ast
 from pathlib import Path
-source=Path(__file__).with_name("google_stream.py").read_text(encoding="utf-8")
-root=ast.parse(source)
-fn=next(n for n in ast.walk(root) if isinstance(n,ast.FunctionDef) and n.name=="chunks")
-assert any(isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and n.func.attr=="get" for n in ast.walk(fn))
-assert "silent_block" in source
-assert "Microphone capture stalled" in source
-assert "block_seconds = 3200 / 16000" in source
-print("PASS: Google streaming audio pacing and silence watchdog code present")
+source = Path(__file__).with_name("google_stream.py").read_text(encoding="utf-8")
+tree = ast.parse(source)
+generator = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "chunks")
+assert "silent_block" not in source
+assert "bytes(3200 * 2)" not in source
+assert "audio.get(timeout=0.2)" in source
+assert "Microphone produced no PCM" in source
+assert any(isinstance(node, ast.Raise) for node in ast.walk(generator))
+assert any(isinstance(node, ast.Yield) for node in ast.walk(generator))
+print("PASS: only captured microphone PCM is sent; stalls restart recognition")
