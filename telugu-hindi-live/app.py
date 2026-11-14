@@ -19,7 +19,7 @@ from urllib import error as urlerror
 import azure.cognitiveservices.speech as speechsdk
 from google_stream import GoogleMicrophone
 from minute_capture import MinuteCapture
-from minute_summary import summarize_telugu_audio
+from minute_summary import summarize_telugu_audio, GeminiBillingRequired
 from google_tts import google_english_audio
 from terminology import replace_known_names, load_terms
 from dotenv import load_dotenv
@@ -210,7 +210,7 @@ def synthesize_english(text: str) -> bytes:
 
 
 async def minute_summary_worker() -> None:
-    global sequence
+    global sequence, running, minute_mic
     assert translation_queue is not None
     while True:
         wav, captured_at = await translation_queue.get()
@@ -241,6 +241,25 @@ async def minute_summary_worker() -> None:
                      seq,metrics["translate_s"],metrics["tts_s"],metrics["total_s"])
         except asyncio.CancelledError:
             raise
+        except GeminiBillingRequired as exc:
+            metrics["dropped"] += 1
+            running = False
+            log.error("%s", exc)
+            await publish({"type":"warning", "message":str(exc)})
+            await publish({"type":"status", "running":False})
+            if minute_mic:
+                mic = minute_mic
+                minute_mic = None
+                await asyncio.to_thread(mic.stop)
+            # Drain captured audio rather than retaining unprocessable WAVs.
+            while True:
+                try:
+                    translation_queue.get_nowait()
+                    translation_queue.task_done()
+                    metrics["dropped"] += 1
+                except asyncio.QueueEmpty:
+                    break
+            break
         except Exception as exc:
             metrics["dropped"] += 1
             log.exception("One-minute summary processing failed")

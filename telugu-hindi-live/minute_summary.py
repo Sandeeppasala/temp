@@ -4,6 +4,10 @@ import json
 import os
 from urllib import request, error
 
+class GeminiBillingRequired(RuntimeError):
+    """Non-retriable Gemini API billing/prepaid-credit failure."""
+
+
 MODEL_DEFAULT = "gemini-3.8-flash"
 API_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
@@ -43,7 +47,18 @@ def summarize_telugu_audio(wav: bytes) -> str:
         with request.urlopen(req, timeout=100) as response:
             payload = json.load(response)
     except error.HTTPError as exc:
-        raise RuntimeError(f"Gemini audio summary HTTP {exc.code}; check Gemini API key, model and billing") from None
+        # Never log the key or original request/audio. 402 is a non-retryable
+        # prepay/billing failure; other codes remain distinguishable.
+        if exc.code == 402:
+            raise GeminiBillingRequired(
+                "Gemini HTTP 402 Payment Required: prepaid API credits depleted. "
+                "Check the Gemini API project billing in Google AI Studio. "
+                "Summary capture paused until billing is resolved and restarted."
+            ) from None
+        raise RuntimeError(
+            f"Gemini audio summary HTTP {exc.code}; verify API key, "
+            "selected model, project billing and quota"
+        ) from None
     # Interactions API returns an output array of typed text blocks.
     parts = payload.get("outputs") or payload.get("output") or []
     chunks = []
