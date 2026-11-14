@@ -265,7 +265,7 @@ async def start(x_admin_key: str | None = Header(default=None)):
 
 @app.post("/api/stop")
 async def stop(x_admin_key: str | None = Header(default=None)):
-    global running, recognizer, worker_task, translation_queue, sarvam_session
+    global running, recognizer, worker_task, translation_queue
     admin_auth(x_admin_key)
     async with control_lock:
         running = False
