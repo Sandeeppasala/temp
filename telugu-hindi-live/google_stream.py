@@ -38,6 +38,8 @@ class GoogleMicrophone:
                 model="latest_long", enable_automatic_punctuation=True)
             terms = load_terms()
             if terms:
+                # Only uncommon proper names and titles are STT hints.
+                # Never boost 150 common nouns: it can bias recognition badly.
                 # Recognition hinting favors supplied proper names but cannot
                 # force the recognizer to hear words that were not spoken.
                 config.speech_contexts.append(speech.SpeechContext(

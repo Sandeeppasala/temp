@@ -6,6 +6,7 @@ Google Translation; Google may still change or omit some names.
 """
 from pathlib import Path
 from functools import lru_cache
+import re
 
 TERMS_PATH = Path(__file__).resolve().parent / "proper_names.tsv"
 
@@ -24,19 +25,33 @@ def load_terms():
         telugu, english = (x.strip() for x in fields)
         if len(telugu) < 2 or len(telugu) > 100 or len(english) > 100:
             raise ValueError(f"proper_names.tsv line {number}: invalid term length")
+        if telugu in names and names[telugu] != english:
+            raise ValueError(f"Conflicting English spellings for {telugu}")
         names[telugu] = english
     if len(names) > 100:
-        raise ValueError("Limit configured terms to 100 to avoid excessive STT hints")
+        raise ValueError("Limit active proper-name substitutions to 100; other terms belong in seth_terms.tsv")
     return names
 
 def replace_known_names(text):
+    """Replace exact glossary names without matching inside longer words.
+
+    Only entries from proper_names.tsv are active. Ordinary vocabulary in
+    seth_terms.tsv is a reference, not an automatic substitution list.
+    """
     terms = load_terms()
-    count = 0
-    # Replace longer terms first to avoid replacing a substring of a longer name.
-    for telugu, english in sorted(terms.items(), key=lambda kv: len(kv[0]), reverse=True):
-        occurrences = text.count(telugu)
-        if occurrences:
-            # Restrict to explicitly configured terms, no automatic noun deletion.
-            text = text.replace(telugu, english)
-            count += occurrences
-    return text, count
+    if not terms:
+        return text, 0
+    names = sorted(terms, key=len, reverse=True)
+    # Telugu combining marks lie inside the Unicode Telugu block. Avoid
+    # replacing a proper name inside a longer inflected/compound Telugu word.
+    pattern = re.compile(
+        r"(?<![\\u0C00-\\u0C7F])(?:" +
+        "|".join(re.escape(name) for name in names) +
+        r")(?![\\u0C00-\\u0C7F])"
+    )
+    substitutions = 0
+    def convert(match):
+        nonlocal substitutions
+        substitutions += 1
+        return terms[match.group(0)]
+    return pattern.sub(convert, text), substitutions
