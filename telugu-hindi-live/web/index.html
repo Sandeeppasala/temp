@@ -13,75 +13,121 @@ small{display:block;margin-top:8px}#status{font-weight:600}
 <h1>🎧 English Live</h1><p class="muted">Telugu → English • Live interpretation for workshop attendees</p>
 <label for="code">Event access code</label>
 <div class="row"><input id="code" type="password" autocomplete="off" placeholder="Enter event code">
-<button id="join">Start Listening</button><button id="leave" disabled>Leave</button></div>
+<button id="join">Start Listening</button><button id="leave" disabled>Leave</button><button id="unlock" disabled>Resume Audio / Test Beep</button></div>
 <p id="status" role="status">Not connected</p>
 <p>Volume <input type="range" id="volume" min="0" max="100" value="85" aria-label="Volume"></p>
 <h2>English interpretation</h2><div id="caption" aria-live="polite">English translation will appear here.</div>
 <p class="muted">Live Telugu recognition (preliminary): <span id="teluguLive">Waiting for speech…</span></p>
 <small id="details" class="muted"></small>
+<p id="diagnostics" class="muted" aria-live="polite">Audio diagnostics: not connected</p>
 <p class="muted">Use headphones. Keep this page open and your screen awake. New listeners hear future speech only. Translation may be delayed or imperfect.</p>
 </main><script>
 const $=id=>document.getElementById(id);
-let ws=null, ctx=null, gain=null, nextTime=0, connected=false, epoch=0;
+let ws=null,ctx=null,gain=null,epoch=0,nextTime=0;
+let chain=Promise.resolve(),received=0,scheduled=0,skipped=0,failed=0,lastError='',lastSeq=0;
 const status=s=>$('status').textContent=s;
+function report(){
+  const state=ctx?ctx.state:'none';
+  const backlog=ctx?Math.max(0,nextTime-ctx.currentTime):0;
+  $('diagnostics').textContent='Audio: '+state+' | received '+received+' | played '+scheduled+' | skipped '+skipped+
+    ' | errors '+failed+' | queued '+backlog.toFixed(1)+'s'+(lastError?' | '+lastError:'');
+}
 function cleanup(){
-  connected=false; epoch++; if(ws){ws.onclose=null;ws.close();ws=null}
-  if(ctx){ctx.close();ctx=null} gain=null;nextTime=0;
-  $('join').disabled=false;$('leave').disabled=true;
+  epoch++; if(ws){ws.onclose=null;ws.close();ws=null}
+  if(ctx){ctx.close().catch(()=>{});ctx=null}
+  gain=null;nextTime=0;chain=Promise.resolve();
+  received=scheduled=skipped=failed=lastSeq=0;lastError='';
+  $('join').disabled=false;$('leave').disabled=true;$('unlock').disabled=true;
+  report();
+}
+async function audioReady(){
+  if(!ctx)throw Error('No audio context');
+  if(ctx.state==='suspended'){
+    // Never await resume in a stream callback: iOS can leave it unresolved
+    // until a new user gesture. The explicit button below unlocks playback.
+    ctx.resume().catch(e=>{lastError='resume: '+e.message;report()});
+  }
+}
+async function playPacket(msg,myEpoch){
+  if(myEpoch!==epoch||!ctx)return;
+  try{
+    if(!msg.audio)throw Error('Missing WAV data');
+    const raw=atob(msg.audio), bytes=new Uint8Array(raw.length);
+    for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);
+    const buffer=await ctx.decodeAudioData(bytes.buffer);
+    if(myEpoch!==epoch||!ctx)return;
+    audioReady();
+    if(ctx.state!=='running'){
+      failed++;lastError='Audio suspended. Tap Resume Audio / Test Beep.';
+      report();return;
+    }
+    const delay=Math.max(0,nextTime-ctx.currentTime);
+    if(delay>12){
+      skipped++;
+      status('Audio queue exceeded 12s; skipped phrase.');report();return;
+    }
+    const source=ctx.createBufferSource();
+    source.buffer=buffer;source.connect(gain);
+    const when=Math.max(ctx.currentTime+0.06,nextTime);
+    source.start(when);nextTime=when+buffer.duration;
+    scheduled++;lastSeq=msg.seq;
+    report();
+  }catch(e){failed++;lastError='Playback: '+e.message;report();status(lastError)}
 }
 $('volume').oninput=()=>{if(gain)gain.gain.value=Number($('volume').value)/100};
+$('unlock').onclick=async()=>{
+  if(!ctx)return;
+  try{
+    await ctx.resume();
+    // Audible local tone confirms browser/audio-route availability independently of cloud.
+    const osc=ctx.createOscillator(),amp=ctx.createGain();
+    osc.frequency.value=660;amp.gain.value=0.08;
+    osc.connect(amp);amp.connect(ctx.destination);
+    osc.start();osc.stop(ctx.currentTime+0.18);
+    lastError='';status('Audio resumed; test beep triggered');report();
+  }catch(e){lastError='Resume failed: '+e.message;report()}
+};
 $('join').onclick=async()=>{
   const code=$('code').value.trim();
   if(!code){status('Enter the event code.');return}
   cleanup();
   try{
     ctx=new (window.AudioContext||window.webkitAudioContext)();
+    gain=ctx.createGain();gain.gain.value=Number($('volume').value)/100;gain.connect(ctx.destination);
     await ctx.resume();
-    gain=ctx.createGain();gain.gain.value=Number($('volume').value)/100;
-    gain.connect(ctx.destination);
     const myEpoch=epoch;
+    ctx.onstatechange=()=>{if(myEpoch===epoch)report()};
+    $('join').disabled=true;$('leave').disabled=false;$('unlock').disabled=false;
     ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
-    $('join').disabled=true;$('leave').disabled=false;status('Connecting…');
+    status('Connecting…');report();
     ws.onopen=()=>ws.send(JSON.stringify({type:'auth',code}));
-    ws.onmessage=async event=>{
+    ws.onmessage=event=>{
       if(myEpoch!==epoch)return;
       let msg;try{msg=JSON.parse(event.data)}catch{return}
-      if(msg.type==='status'){connected=true;status(msg.running?'Connected • translation live':'Connected • waiting for speaker');return}
+      if(msg.type==='status'){status(msg.running?'Connected • translation live':'Connected • waiting for speaker');return}
       if(msg.type==='warning'){status(msg.message);return}
-      if(msg.type==='partial'){$('teluguLive').textContent=msg.telugu || '';return}
-      if(msg.type==='caption'){$('caption').textContent=msg.english ?? '';return}
+      if(msg.type==='partial'){$('teluguLive').textContent=msg.telugu||'';return}
+      if(msg.type==='caption'){
+        $('caption').textContent=msg.english??'';
+        $('details').textContent='English caption '+msg.seq;return;
+      }
       if(msg.type!=='segment')return;
-      $('caption').textContent=msg.english ?? '';
-      $('details').textContent='Segment '+msg.seq+(msg.telugu?' • Telugu: '+msg.telugu:'');
-      // decodeAudioData may complete out of order. Reserve scheduling in arrival order.
-      const raw=atob(msg.audio), bytes=new Uint8Array(raw.length);
-      for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);
-      try{
-        if(ctx.state==='suspended')await ctx.resume();
-        const buffer=await ctx.decodeAudioData(bytes.buffer);
-        if(myEpoch!==epoch)return;
-        const source=ctx.createBufferSource();source.buffer=buffer;source.connect(gain);
-        // Don't extend a long queue with stale audio. Keep the current stream
-        // close to live, at the expense of possibly skipping a phrase.
-        const delay=Math.max(0,nextTime-ctx.currentTime);
-        if(delay>12){
-          status('Live audio falling behind; skipping an older translated phrase.');
-          return;
-        }
-        const when=Math.max(ctx.currentTime+0.1,nextTime);
-        source.start(when);nextTime=when+buffer.duration;
-        $('details').textContent+=' • audio queued '+Math.max(0,nextTime-ctx.currentTime).toFixed(1)+'s';
-        if(nextTime-ctx.currentTime>8){
-          status('Audio is several seconds behind. Playback is catching up.');
-        }
-      }catch(e){status('Audio playback problem: '+e.message)}
+      received++;report();
+      $('caption').textContent=msg.english??'';
+      // An ordered chain avoids out-of-order decoding/scheduling.
+      chain=chain.then(()=>playPacket(msg,myEpoch)).catch(e=>{
+        failed++;lastError='Audio queue: '+e.message;report();
+      });
     };
     ws.onclose=ev=>{
       if(myEpoch!==epoch)return;
-      cleanup();status(ev.code===1008?'Wrong event access code.':ev.code===1013?'Event is full.':'Disconnected. Tap Start Listening to reconnect.');
+      cleanup();status(ev.code===1008?'Wrong event code':ev.code===1013?'Event full':'Disconnected. Rejoin.');
     };
-    ws.onerror=()=>status('Connection error. Check event URL and internet.');
+    ws.onerror=()=>status('WebSocket error. Check the Wi-Fi connection.');
   }catch(e){cleanup();status('Cannot start audio: '+e.message)}
 };
 $('leave').onclick=()=>{cleanup();status('Disconnected')};
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden&&ctx){audioReady();report()}
+});
 </script></body></html>
