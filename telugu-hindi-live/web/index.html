@@ -17,6 +17,7 @@ small{display:block;margin-top:8px}#status{font-weight:600}
 <p id="status" role="status">Not connected</p>
 <p>Volume <input type="range" id="volume" min="0" max="100" value="85" aria-label="Volume"></p>
 <h2>English interpretation</h2><div id="caption" aria-live="polite">English translation will appear here.</div>
+<p class="muted">Live Telugu recognition (preliminary): <span id="teluguLive">Waiting for speech…</span></p>
 <small id="details" class="muted"></small>
 <p class="muted">Use headphones. Keep this page open and your screen awake. New listeners hear future speech only. Translation may be delayed or imperfect.</p>
 </main><script>
@@ -47,6 +48,7 @@ $('join').onclick=async()=>{
       let msg;try{msg=JSON.parse(event.data)}catch{return}
       if(msg.type==='status'){connected=true;status(msg.running?'Connected • translation live':'Connected • waiting for speaker');return}
       if(msg.type==='warning'){status(msg.message);return}
+      if(msg.type==='partial'){$('teluguLive').textContent=msg.telugu || '';return}
       if(msg.type!=='segment')return;
       $('caption').textContent=msg.english ?? '';
       $('details').textContent='Segment '+msg.seq+(msg.telugu?' • Telugu: '+msg.telugu:'');
@@ -57,9 +59,18 @@ $('join').onclick=async()=>{
         const buffer=await ctx.decodeAudioData(bytes.buffer);
         if(myEpoch!==epoch)return;
         const source=ctx.createBufferSource();source.buffer=buffer;source.connect(gain);
+        // Don't extend a long queue with stale audio. Keep the current stream
+        // close to live, at the expense of possibly skipping a phrase.
+        const delay=Math.max(0,nextTime-ctx.currentTime);
+        if(delay>12){
+          status('Live audio falling behind; skipping an older translated phrase.');
+          return;
+        }
         const when=Math.max(ctx.currentTime+0.1,nextTime);
         source.start(when);nextTime=when+buffer.duration;
-        if(nextTime-ctx.currentTime>35){status('Audio delay is building up. Ask organizer to pause briefly.')}
+        if(nextTime-ctx.currentTime>8){
+          status('Audio is several seconds behind. Playback is catching up.');
+        }
       }catch(e){status('Audio playback problem: '+e.message)}
     };
     ws.onclose=ev=>{

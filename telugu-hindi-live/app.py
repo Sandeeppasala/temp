@@ -140,6 +140,13 @@ def google_recognized(telugu: str) -> None:
     loop.call_soon_threadsafe(enqueue)
 
 
+def google_partial(telugu: str) -> None:
+    if loop is not None and running:
+        loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(publish({"type": "partial", "telugu": telugu}))
+        )
+
+
 def google_failed(message: str) -> None:
     log.error("%s", message)
     if loop is not None:
@@ -257,12 +264,12 @@ async def start(x_admin_key: str | None = Header(default=None)):
             raise HTTPException(400, "Set TRANSLATION_PROVIDER=google or azure")
         if not configured():
             raise HTTPException(400, "Configure Google Translation key and Azure credentials if using fallback")
-        translation_queue = asyncio.Queue(maxsize=12)
+        translation_queue = asyncio.Queue(maxsize=5)
         worker_task = asyncio.create_task(translation_worker())
         running = True
         try:
             if provider == "google":
-                google_mic = GoogleMicrophone(google_recognized, google_failed)
+                google_mic = GoogleMicrophone(google_recognized, google_failed, google_partial)
                 google_mic.start()
             else:
                 cfg = speechsdk.SpeechConfig(
