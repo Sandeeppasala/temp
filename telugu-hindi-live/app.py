@@ -46,6 +46,7 @@ translation_queue: asyncio.Queue | None = None
 worker_task: asyncio.Task | None = None
 sequence = 0
 metrics = {"queue_wait_s": 0.0, "translate_s": 0.0, "tts_s": 0.0, "total_s": 0.0, "dropped": 0, "processed": 0}
+speech_health = {"last_partial": 0.0, "last_queued": 0.0, "last_audio_sent": 0.0, "queued_chunks": 0}
 
 
 def check_secret(given: str, expected: str) -> bool:
@@ -138,6 +139,8 @@ def google_recognized(telugu: str) -> None:
     def enqueue():
         if running and translation_queue and not translation_queue.full():
             translation_queue.put_nowait((telugu, time.monotonic()))
+            speech_health["last_queued"] = time.monotonic()
+            speech_health["queued_chunks"] += 1
             if translation_queue.qsize() > 15:
                 log.warning("Google translation backlog: %d phrases", translation_queue.qsize())
         else:
@@ -147,6 +150,7 @@ def google_recognized(telugu: str) -> None:
 
 
 def google_partial(telugu: str) -> None:
+    speech_health["last_partial"] = time.monotonic()
     if loop is not None and running:
         loop.call_soon_threadsafe(
             lambda: asyncio.create_task(publish({"type": "partial", "telugu": telugu}))
@@ -201,6 +205,7 @@ async def translation_worker() -> None:
             metrics["tts_s"] = round(time.monotonic() - tts_start, 2)
             metrics["total_s"] = round(time.monotonic() - received_at, 2)
             metrics["processed"] += 1
+            speech_health["last_audio_sent"] = time.monotonic()
             await publish({
                 "type": "segment", "seq": seq,
                 "telugu": telugu, "english": english,
@@ -270,7 +275,10 @@ def status(x_admin_key: str | None = Header(default=None)):
             "provider": provider, "speech_engine": provider, "tts_engine": provider,
             "target_language": TARGET_LANGUAGE,
             "voice": ENGLISH_VOICE, "provider_configured": configured(),
-            "metrics": dict(metrics), "queued_phrases": translation_queue.qsize() if translation_queue else 0}
+            "metrics": dict(metrics), "queued_phrases": translation_queue.qsize() if translation_queue else 0,
+            "speech_health": {**{k+"_age_s": round(time.monotonic()-v, 1) if v else None
+                               for k,v in speech_health.items() if k.startswith("last_")},
+                              "queued_chunks": speech_health["queued_chunks"]}}
 
 
 @app.post("/api/start")
