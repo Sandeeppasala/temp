@@ -18,6 +18,8 @@ from urllib import error as urlerror
 
 import azure.cognitiveservices.speech as speechsdk
 from google_stream import GoogleMicrophone
+from minute_capture import MinuteCapture
+from minute_summary import summarize_telugu_audio
 from google_tts import google_english_audio
 from terminology import replace_known_names, load_terms
 from dotenv import load_dotenv
@@ -33,6 +35,7 @@ event_code = os.getenv("EVENT_CODE", "")
 admin_key = os.getenv("ADMIN_KEY", "")
 max_listeners = int(os.getenv("MAX_LISTENERS", "25"))
 provider = os.getenv("TRANSLATION_PROVIDER", "google").strip().lower()
+interpretation_mode = os.getenv("INTERPRETATION_MODE", "minute_summary").strip().lower()
 # Google Cloud Translation Basic converts recognized Telugu text to English.
 TARGET_LANGUAGE = "en"
 GOOGLE_TRANSLATE_KEY = os.getenv("GOOGLE_TRANSLATE_API_KEY", "").strip()
@@ -43,6 +46,7 @@ clients: set[WebSocket] = set()
 running = False
 recognizer = None
 google_mic = None
+minute_mic = None
 translation_queue: asyncio.Queue | None = None
 worker_task: asyncio.Task | None = None
 sequence = 0
@@ -70,6 +74,9 @@ def google_configured() -> bool:
 
 
 def configured() -> bool:
+    if interpretation_mode == "minute_summary":
+        return bool(os.getenv("GEMINI_API_KEY", "").strip()) and bool(
+            os.getenv("GOOGLE_TTS_API_KEY", "").strip() or GOOGLE_TRANSLATE_KEY)
     return google_configured() and (provider == "google" or (provider == "azure" and azure_configured()))
 
 
@@ -153,6 +160,22 @@ def google_recognized(telugu: str) -> None:
     loop.call_soon_threadsafe(enqueue)
 
 
+def minute_audio_received(wav: bytes) -> None:
+    if not running or loop is None or translation_queue is None:
+        return
+    def enqueue():
+        if running and translation_queue is not None:
+            if translation_queue.full():
+                metrics["dropped"] += 1
+                log.error("One-minute summary queue FULL; 60 seconds of speech were lost")
+                asyncio.create_task(publish({"type":"warning",
+                    "message":"Summary backlog full; one minute could not be processed"}))
+            else:
+                translation_queue.put_nowait((wav, time.monotonic()))
+                log.info("Captured real 60-second audio window; queued %d bytes", len(wav))
+    loop.call_soon_threadsafe(enqueue)
+
+
 def google_partial(telugu: str) -> None:
     speech_health["last_partial"] = time.monotonic()
     if loop is not None and running:
@@ -184,6 +207,48 @@ def synthesize_english(text: str) -> bytes:
     if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
         raise RuntimeError("English speech synthesis failed: " + str(result.reason))
     return bytes(result.audio_data)
+
+
+async def minute_summary_worker() -> None:
+    global sequence
+    assert translation_queue is not None
+    while True:
+        wav, captured_at = await translation_queue.get()
+        try:
+            log.info("Processing 60-second Telugu audio window")
+            started = time.monotonic()
+            english = await asyncio.to_thread(summarize_telugu_audio, wav)
+            metrics["translate_s"] = round(time.monotonic()-started,2)
+            if english.strip() == "NO_INTELLIGIBLE_SPEECH":
+                log.info("No intelligible speech in this minute; no TTS audio generated")
+                continue
+            if not english.strip():
+                raise ValueError("Empty English summary")
+            sequence += 1
+            seq = sequence
+            await publish({"type":"caption","seq":seq,"english":english,"telugu":"",
+                           "kind":"minute_summary"})
+            start_tts=time.monotonic()
+            output = await asyncio.to_thread(google_english_audio,english)
+            metrics["tts_s"] = round(time.monotonic()-start_tts,2)
+            metrics["total_s"] = round(time.monotonic()-captured_at,2)
+            metrics["processed"] += 1
+            await publish({"type":"segment","seq":seq,"english":english,
+                           "telugu":"","kind":"minute_summary",
+                           "audio":base64.b64encode(output).decode("ascii"),
+                           "mime":"audio/wav","timing":dict(metrics)})
+            log.info("Minute summary %d: understanding %.2fs, TTS %.2fs, post-capture %.2fs",
+                     seq,metrics["translate_s"],metrics["tts_s"],metrics["total_s"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            metrics["dropped"] += 1
+            log.exception("One-minute summary processing failed")
+            await publish({"type":"warning",
+                           "message":"Minute summary failed: "+type(exc).__name__+
+                           ". Check server logs and Gemini API key."})
+        finally:
+            translation_queue.task_done()
 
 
 async def translation_worker() -> None:
@@ -238,8 +303,11 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global running, recognizer, worker_task, google_mic
+    global running, recognizer, worker_task, google_mic, minute_mic
     running = False
+    if minute_mic:
+        await asyncio.to_thread(minute_mic.stop)
+        minute_mic = None
     if google_mic:
         await asyncio.to_thread(google_mic.stop)
         google_mic = None
@@ -278,6 +346,7 @@ def status(x_admin_key: str | None = Header(default=None)):
             "translation_engine": "google-cloud-translation-v2",
             "provider": provider, "speech_engine": provider, "tts_engine": provider,
             "configured_names": len(load_terms()),
+            "interpretation_mode": interpretation_mode,
             "target_language": TARGET_LANGUAGE,
             "voice": ENGLISH_VOICE, "provider_configured": configured(),
             "metrics": dict(metrics), "queued_phrases": translation_queue.qsize() if translation_queue else 0,
@@ -288,22 +357,31 @@ def status(x_admin_key: str | None = Header(default=None)):
 
 @app.post("/api/start")
 async def start(x_admin_key: str | None = Header(default=None)):
-    global running, recognizer, translation_queue, worker_task, google_mic
+    global running, recognizer, translation_queue, worker_task, google_mic, minute_mic
     admin_auth(x_admin_key)
     async with control_lock:
         if running:
             return {"running": True, "provider": provider}
         if not event_code or event_code == admin_key:
             raise HTTPException(400, "Set distinct EVENT_CODE and ADMIN_KEY in .env")
+        if interpretation_mode not in ("minute_summary","live"):
+            raise HTTPException(400, "INTERPRETATION_MODE must be minute_summary or live")
+        if interpretation_mode == "minute_summary" and provider != "google":
+            raise HTTPException(400, "Minute summary mode requires TRANSLATION_PROVIDER=google")
         if provider not in ("azure", "google"):
             raise HTTPException(400, "Set TRANSLATION_PROVIDER=google or azure")
         if not configured():
-            raise HTTPException(400, "Configure Google Translation key and Azure credentials if using fallback")
-        translation_queue = asyncio.Queue(maxsize=100)
-        worker_task = asyncio.create_task(translation_worker())
+            raise HTTPException(400, "For minute summaries set GEMINI_API_KEY and GOOGLE_TTS_API_KEY in .env, then restart the server")
+        translation_queue = asyncio.Queue(maxsize=100 if interpretation_mode=="live" else 12)
+        worker_task = asyncio.create_task(
+            minute_summary_worker() if interpretation_mode=="minute_summary"
+            else translation_worker())
         running = True
         try:
-            if provider == "google":
+            if interpretation_mode == "minute_summary":
+                minute_mic = MinuteCapture(minute_audio_received, google_failed)
+                minute_mic.start()
+            elif provider == "google":
                 google_mic = GoogleMicrophone(google_recognized, google_failed, google_partial)
                 google_mic.start()
             else:
@@ -323,6 +401,9 @@ async def start(x_admin_key: str | None = Header(default=None)):
             if google_mic:
                 await asyncio.to_thread(google_mic.stop)
                 google_mic = None
+            if minute_mic:
+                await asyncio.to_thread(minute_mic.stop)
+                minute_mic = None
             if worker_task:
                 worker_task.cancel()
                 try:
@@ -339,13 +420,16 @@ async def start(x_admin_key: str | None = Header(default=None)):
 
 @app.post("/api/stop")
 async def stop(x_admin_key: str | None = Header(default=None)):
-    global running, recognizer, worker_task, translation_queue, google_mic
+    global running, recognizer, worker_task, translation_queue, google_mic, minute_mic
     admin_auth(x_admin_key)
     async with control_lock:
         running = False
         if google_mic:
             await asyncio.to_thread(google_mic.stop)
             google_mic = None
+        if minute_mic:
+            await asyncio.to_thread(minute_mic.stop)
+            minute_mic = None
         if recognizer:
             await asyncio.to_thread(
                 lambda: recognizer.stop_continuous_recognition_async().get())

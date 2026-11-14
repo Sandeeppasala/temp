@@ -10,7 +10,7 @@ button{border:0;background:#1b6bba;color:white;cursor:pointer}button:disabled{op
 #caption{background:#eaf2fb;padding:16px;border-radius:12px;min-height:70px;font-size:22px}
 small{display:block;margin-top:8px}#status{font-weight:600}
 </style></head><body><main>
-<h1>🎧 English Live</h1><p class="muted">Telugu → English • Live interpretation for workshop attendees</p>
+<h1>🎧 English Live</h1><p class="muted">Telugu → English • Spoken meaning summaries every minute</p>
 <label for="code">Event access code</label>
 <div class="row"><input id="code" type="password" autocomplete="off" placeholder="Enter event code">
 <button id="join">Start Listening</button><button id="leave" disabled>Leave</button><button id="unlock" disabled>Resume Audio / Test Beep</button></div>
@@ -23,7 +23,7 @@ small{display:block;margin-top:8px}#status{font-weight:600}
 <h2>Live Telugu recognition</h2><div id="teluguLive" style="background:#f0f6f1;padding:16px;border-radius:12px;min-height:70px;font-size:21px" aria-live="polite">Waiting for speech…</div>
 <small id="details" class="muted"></small>
 <p id="diagnostics" class="muted" aria-live="polite">Audio diagnostics: not connected</p>
-<p class="muted">Use headphones. Keep this page open and your screen awake. New listeners hear future speech only. Recognition sometimes emits 1–3 word clips and may pause before the next phrase. Queue underruns indicate no English audio remains to play; they do not prove the browser dropped any speech. The browser schedules up to 60 seconds ahead; later received phrases wait in order. This does not fix speech lost before reaching the phone.</p>
+<p class="muted">Use headphones. Keep this page open and your screen awake. New listeners hear future summaries only. Recognition sometimes emits 1–3 word clips and may pause before the next phrase. Queue underruns indicate no English audio remains to play; they do not prove the browser dropped any speech. The browser schedules up to 60 seconds ahead; later received phrases wait in order. This does not fix speech lost before reaching the phone.</p>
 </main><script>
 const $=id=>document.getElementById(id);
 let ws=null,ctx=null,gain=null,epoch=0,nextTime=0;
