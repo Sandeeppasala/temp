@@ -22,4 +22,7 @@ assert replace_known_names("సేత్ చెప్పిన ప్రేమ �
 assert replace_known_names("సేత్ విజ్ఞానం గురించి") == ("Seth Wisdom గురించి", 1)
 assert replace_known_names("ప్రేమ శక్తి ఆత్మ") == ("ప్రేమ శక్తి ఆత్మ", 0)
 assert replace_known_names("సేత్‌తో కలిసి") == ("సేత్‌తో కలిసి", 0)
+assert replace_known_names("మాసేత్") == ("మాసేత్", 0)
+assert replace_known_names("సేత్‍తో కలిసి") == ("సేత్‍తో కలిసి", 0)
+assert replace_known_names("సేత్ చెప్పారు") == ("Seth చెప్పారు", 1)
 print("PASS:", len(reference), "unique reference entries,", len(active), "active proper names, no duplicates")

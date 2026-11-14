@@ -42,12 +42,13 @@ def replace_known_names(text):
     if not terms:
         return text, 0
     names = sorted(terms, key=len, reverse=True)
-    # Telugu combining marks lie inside the Unicode Telugu block. Avoid
-    # replacing a proper name inside a longer inflected/compound Telugu word.
+    # Telugu combining marks, virama and base letters lie in U+0C00–U+0C7F.
+    # Zero-width non-joiner/joiner (U+200C/U+200D) can connect a suffix,
+    # e.g. సేత్‌తో. None of these may count as a word boundary.
     pattern = re.compile(
-        r"(?<![\\u0C00-\\u0C7F])(?:" +
+        r"(?<![\u0C00-\u0C7F\u200C\u200D])(?:" +
         "|".join(re.escape(name) for name in names) +
-        r")(?![\\u0C00-\\u0C7F])"
+        r")(?![\u0C00-\u0C7F\u200C\u200D])"
     )
     substitutions = 0
     def convert(match):
