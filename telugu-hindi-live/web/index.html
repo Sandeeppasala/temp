@@ -16,18 +16,22 @@ small{display:block;margin-top:8px}#status{font-weight:600}
 <button id="join">Start Listening</button><button id="leave" disabled>Leave</button><button id="unlock" disabled>Resume Audio / Test Beep</button></div>
 <p id="status" role="status">Not connected</p>
 <p>Volume <input type="range" id="volume" min="0" max="100" value="85" aria-label="Volume"></p>
-<p>Playback speed <select id="speed" aria-label="Playback speed"><option value="1">1.0× Natural</option><option value="1.1" selected>1.1× Slightly faster</option><option value="1.2">1.2× Faster</option><option value="1.3">1.3× Fast</option></select></p>
-<h2>English interpretation</h2><div id="caption" aria-live="polite">English translation will appear here.</div>
+<p>Playback speed <select id="speed" aria-label="Playback speed"><option value="1" selected>1.0× Natural</option><option value="1.1">1.1× Slightly faster</option><option value="1.2">1.2× Faster</option><option value="1.3">1.3× Fast</option></select></p>
+<h2>English currently speaking</h2><div id="caption" aria-live="polite">English audio will appear here when it plays.</div>
+<p class="muted">Telugu corresponding to this audio: <span id="spokenTelugu">Waiting…</span></p>
+<h2>Latest translated text (may be ahead of audio)</h2><div id="latest" class="muted">Waiting for finalized speech…</div>
+<h3>Last 15 translated phrases</h3><div id="history" class="muted"></div>
 <p class="muted">Live Telugu recognition (preliminary): <span id="teluguLive">Waiting for speech…</span></p>
 <small id="details" class="muted"></small>
 <p id="diagnostics" class="muted" aria-live="polite">Audio diagnostics: not connected</p>
-<p class="muted">Use headphones. Keep this page open and your screen awake. New listeners hear future speech only. Finalized phrases preserve more context, but may arrive after a pause. The browser schedules up to 60 seconds ahead; later received phrases wait in order. This does not fix speech lost before reaching the phone.</p>
+<p class="muted">Use headphones. Keep this page open and your screen awake. New listeners hear future speech only. Accuracy-first mode translates only finalized Telugu phrases, which may produce long pauses during uninterrupted speech. The browser schedules up to 60 seconds ahead; later received phrases wait in order. This does not fix speech lost before reaching the phone.</p>
 </main><script>
 const $=id=>document.getElementById(id);
 let ws=null,ctx=null,gain=null,epoch=0,nextTime=0;
 const MAX_SCHEDULED_SECONDS=60;
 let chain=Promise.resolve(),received=0,scheduled=0,skipped=0,failed=0,lastError='',lastSeq=0;
 let pending=[],pendingSeconds=0,sequenceGaps=0,overLimitEvents=0,drainTimer=null;
+let history=[],playingSchedule=[];
 const status=s=>$('status').textContent=s;
 function report(){
   const state=ctx?ctx.state:'none';
@@ -43,7 +47,11 @@ function cleanup(){
   if(ctx){ctx.close().catch(()=>{});ctx=null}
   gain=null;nextTime=0;chain=Promise.resolve();
   received=scheduled=skipped=failed=lastSeq=sequenceGaps=overLimitEvents=0;
-  pending=[];pendingSeconds=0;lastError='';
+  pending=[];pendingSeconds=0;lastError='';history=[];playingSchedule=[];
+  $('history').replaceChildren();
+  $('latest').textContent='Waiting for finalized speech…';
+  $('caption').textContent='English audio will appear here when it plays.';
+  $('spokenTelugu').textContent='Waiting…';
   $('join').disabled=false;$('leave').disabled=true;$('unlock').disabled=true;
   report();
 }
@@ -70,7 +78,20 @@ function drainAudio(myEpoch){
     const source=ctx.createBufferSource();
     source.buffer=item.buffer;source.playbackRate.value=rate;source.connect(gain);
     const when=Math.max(ctx.currentTime+0.03,nextTime);
+    source.onended=()=>{if(myEpoch===epoch)report()};
+    // Show the EXACT English phrase whose audio has begun, not the
+    // most recently translated phrase that might be a minute ahead.
+    source.onended=()=>{if(myEpoch===epoch)report()};
+    const showAtStart=()=>{
+      if(myEpoch!==epoch)return;
+      $('caption').textContent=item.english||'';
+      $('spokenTelugu').textContent=item.telugu||'';
+      $('details').textContent='Playing audio segment '+item.seq;
+    };
+    // AudioBufferSourceNode doesn't have onstart; schedule a synchronized
+    // UI update from the playback queue when its clip becomes current.
     source.start(when);nextTime=when+duration;scheduled++;
+    item.when=when;item.show=showAtStart;playingSchedule.push(item);
   }
   const backlog=Math.max(0,nextTime-ctx.currentTime);
   if(backlog>8||pending.length){
@@ -94,7 +115,7 @@ async function playPacket(msg,myEpoch){
     }
     const backlog=Math.max(0,nextTime-ctx.currentTime);
     if(backlog+pendingSeconds+buffer.duration>MAX_SCHEDULED_SECONDS)overLimitEvents++;
-    pending.push({buffer,seq:msg.seq});
+    pending.push({buffer,seq:msg.seq,english:msg.english,telugu:msg.telugu});
     pendingSeconds+=buffer.duration;
     drainAudio(myEpoch);
     report();
@@ -124,7 +145,14 @@ $('join').onclick=async()=>{
     const myEpoch=epoch;
     ctx.onstatechange=()=>{if(myEpoch===epoch)report()};
     $('join').disabled=true;$('leave').disabled=false;$('unlock').disabled=false;
-    drainTimer=setInterval(()=>drainAudio(myEpoch),500);
+    drainTimer=setInterval(()=>{
+      drainAudio(myEpoch);
+      if(ctx&&ctx.state==='running'){
+        while(playingSchedule.length && playingSchedule[0].when<=ctx.currentTime+0.02){
+          playingSchedule.shift().show();
+        }
+      }
+    },100);
     ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
     status('Connecting…');report();
     ws.onopen=()=>ws.send(JSON.stringify({type:'auth',code}));
@@ -135,8 +163,16 @@ $('join').onclick=async()=>{
       if(msg.type==='warning'){status(msg.message);return}
       if(msg.type==='partial'){$('teluguLive').textContent=msg.telugu||'';return}
       if(msg.type==='caption'){
-        $('caption').textContent=msg.english??'';
-        $('details').textContent='English caption '+msg.seq;return;
+        $('latest').textContent='Telugu: '+(msg.telugu||'')+' | English: '+(msg.english||'');
+        history.unshift({seq:msg.seq,telugu:msg.telugu||'',english:msg.english||''});
+        history=history.slice(0,15);
+        $('history').replaceChildren();
+        for(const h of history){
+          const p=document.createElement('p');
+          p.textContent='#'+h.seq+' Telugu: '+h.telugu+' | English: '+h.english;
+          $('history').appendChild(p);
+        }
+        return;
       }
       if(msg.type!=='segment')return;
       received++;
@@ -145,7 +181,7 @@ $('join').onclick=async()=>{
       }
       if(Number.isInteger(msg.seq))lastSeq=msg.seq;
       report();
-      $('caption').textContent=msg.english??'';
+      // English text shown above remains tied to the audio being played.
       // An ordered chain avoids out-of-order decoding/scheduling.
       chain=chain.then(()=>playPacket(msg,myEpoch)).catch(e=>{
         failed++;lastError='Audio queue: '+e.message;report();
