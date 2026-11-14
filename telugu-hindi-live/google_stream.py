@@ -3,6 +3,7 @@ import logging
 import queue
 import threading
 import time
+from terminology import load_terms
 
 log = logging.getLogger("google-stream")
 
@@ -35,6 +36,13 @@ class GoogleMicrophone:
                 encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
                 sample_rate_hertz=16000, language_code="te-IN",
                 model="latest_long", enable_automatic_punctuation=True)
+            terms = load_terms()
+            if terms:
+                # Recognition hinting favors supplied proper names but cannot
+                # force the recognizer to hear words that were not spoken.
+                config.speech_contexts.append(speech.SpeechContext(
+                    phrases=list(terms.keys()), boost=6.0))
+                log.info("Loaded %d Telugu names/terms as STT hints", len(terms))
             stream_config = speech.StreamingRecognitionConfig(
                 config=config, interim_results=True)
             while not self.stop_event.is_set():

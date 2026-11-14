@@ -19,6 +19,7 @@ from urllib import error as urlerror
 import azure.cognitiveservices.speech as speechsdk
 from google_stream import GoogleMicrophone
 from google_tts import google_english_audio
+from terminology import replace_known_names, load_terms
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -74,8 +75,11 @@ def configured() -> bool:
 
 def google_translate_english(telugu: str) -> str:
     """Translate Telugu text through Google's official, billed Cloud Translation Basic API."""
+    adjusted, replaced = replace_known_names(telugu)
+    if replaced:
+        log.info("Preserved %d configured proper-name occurrences for translation", replaced)
     body = json.dumps({
-        "q": telugu, "source": "te", "target": "en", "format": "text"
+        "q": adjusted, "source": "te", "target": "en", "format": "text"
     }, ensure_ascii=False).encode("utf-8")
     req = urlrequest.Request(
         "https://translation.googleapis.com/language/translate/v2",
@@ -273,6 +277,7 @@ def status(x_admin_key: str | None = Header(default=None)):
             "google_configured": google_configured(),
             "translation_engine": "google-cloud-translation-v2",
             "provider": provider, "speech_engine": provider, "tts_engine": provider,
+            "configured_names": len(load_terms()),
             "target_language": TARGET_LANGUAGE,
             "voice": ENGLISH_VOICE, "provider_configured": configured(),
             "metrics": dict(metrics), "queued_phrases": translation_queue.qsize() if translation_queue else 0,
