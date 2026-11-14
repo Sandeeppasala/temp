@@ -11,8 +11,6 @@ class GoogleMicrophone:
         self.on_text = on_text
         self.on_error = on_error
         self.on_partial = on_partial
-        self.chunk_seconds = 4.5  # Approximate translation cadence; uses stable interim text
-        self.min_words = 5
         self.stop_event = threading.Event()
         self.thread = None
 
@@ -64,8 +62,10 @@ class GoogleMicrophone:
                                 yield speech.StreamingRecognizeRequest(audio_content=block)
                         responses = client.streaming_recognize(
                             config=stream_config, requests=chunks(), timeout=260)
-                        consumed = 0
-                        last_sent = time.monotonic()
+                        # Only translate FINAL results. Interim hypotheses can
+                        # revise words, reorder text and break sentences.
+                        # Translate finalized phrases once; never use word counts
+                        # from mutable interim transcripts as a cursor.
                         for response in responses:
                             if self.stop_event.is_set():
                                 break
@@ -75,25 +75,11 @@ class GoogleMicrophone:
                                 phrase = result.alternatives[0].transcript.strip()
                                 if not phrase:
                                     continue
-                                if self.on_partial and not result.is_final:
-                                    self.on_partial(phrase)
-                                words = phrase.split()
-                                # Each final result ends this recognition segment.
-                                # Interim hypotheses can change; only stable text is chunked.
                                 if result.is_final:
-                                    if len(words) > consumed:
-                                        self.on_text(" ".join(words[consumed:]))
-                                    consumed = 0
-                                    last_sent = time.monotonic()
-                                elif (result.stability >= 0.85
-                                      and len(words) - consumed >= self.min_words + 2
-                                      and time.monotonic() - last_sent >= self.chunk_seconds):
-                                    # Hold back two words because partial hypotheses
-                                    # often revise the end of the phrase.
-                                    end = len(words) - 2
-                                    self.on_text(" ".join(words[consumed:end]))
-                                    consumed = end
-                                    last_sent = time.monotonic()
+                                    log.info("Finalized Telugu phrase (%d characters)", len(phrase))
+                                    self.on_text(phrase)
+                                elif self.on_partial:
+                                    self.on_partial(phrase)
                 except Exception as exc:
                     if not self.stop_event.is_set():
                         log.exception("Google Speech streaming failed")

@@ -5,7 +5,7 @@
 body{margin:0;background:#f4f7fa;color:#16233b;font:16px system-ui,sans-serif}
 main{max-width:620px;margin:32px auto;padding:25px;background:white;border-radius:18px;box-shadow:0 5px 25px #17314a16}
 h1{margin:0 0 8px;font-size:28px}.muted{color:#546579}.row{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}
-input,button{font:inherit;padding:12px;border-radius:9px}input{flex:1;min-width:150px;border:1px solid #b9c7d4}
+input,button,select{font:inherit;padding:12px;border-radius:9px}input{flex:1;min-width:150px;border:1px solid #b9c7d4}
 button{border:0;background:#1b6bba;color:white;cursor:pointer}button:disabled{opacity:.55}
 #caption{background:#eaf2fb;padding:16px;border-radius:12px;min-height:70px;font-size:22px}
 small{display:block;margin-top:8px}#status{font-weight:600}
@@ -16,11 +16,12 @@ small{display:block;margin-top:8px}#status{font-weight:600}
 <button id="join">Start Listening</button><button id="leave" disabled>Leave</button><button id="unlock" disabled>Resume Audio / Test Beep</button></div>
 <p id="status" role="status">Not connected</p>
 <p>Volume <input type="range" id="volume" min="0" max="100" value="85" aria-label="Volume"></p>
+<p>Playback speed <select id="speed" aria-label="Playback speed"><option value="1">1.0× Natural</option><option value="1.1" selected>1.1× Slightly faster</option><option value="1.2">1.2× Faster</option><option value="1.3">1.3× Fast</option></select></p>
 <h2>English interpretation</h2><div id="caption" aria-live="polite">English translation will appear here.</div>
 <p class="muted">Live Telugu recognition (preliminary): <span id="teluguLive">Waiting for speech…</span></p>
 <small id="details" class="muted"></small>
 <p id="diagnostics" class="muted" aria-live="polite">Audio diagnostics: not connected</p>
-<p class="muted">Use headphones. Keep this page open and your screen awake. New listeners hear future speech only. Translation may be delayed or imperfect.</p>
+<p class="muted">Use headphones. Keep this page open and your screen awake. New listeners hear future speech only. Finalized phrases preserve more context, but may arrive after a pause. A growing audio queue can add delay.</p>
 </main><script>
 const $=id=>document.getElementById(id);
 let ws=null,ctx=null,gain=null,epoch=0,nextTime=0;
@@ -62,14 +63,15 @@ async function playPacket(msg,myEpoch){
       report();return;
     }
     const delay=Math.max(0,nextTime-ctx.currentTime);
-    if(delay>12){
-      skipped++;
-      status('Audio queue exceeded 12s; skipped phrase.');report();return;
-    }
+    // Never throw away a translated phrase merely because playback is behind.
+    // Tell the listener how far behind they are instead.
     const source=ctx.createBufferSource();
     source.buffer=buffer;source.connect(gain);
-    const when=Math.max(ctx.currentTime+0.06,nextTime);
-    source.start(when);nextTime=when+buffer.duration;
+    const rate=Number($('speed').value)||1;
+    source.playbackRate.value=rate;
+    const when=Math.max(ctx.currentTime+0.03,nextTime);
+    source.start(when);nextTime=when+buffer.duration/rate;
+    if(delay>8)status('English audio is behind by '+delay.toFixed(1)+'s; preserving every phrase.');
     scheduled++;lastSeq=msg.seq;
     report();
   }catch(e){failed++;lastError='Playback: '+e.message;report();status(lastError)}

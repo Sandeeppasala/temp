@@ -138,9 +138,11 @@ def google_recognized(telugu: str) -> None:
     def enqueue():
         if running and translation_queue and not translation_queue.full():
             translation_queue.put_nowait((telugu, time.monotonic()))
+            if translation_queue.qsize() > 15:
+                log.warning("Google translation backlog: %d phrases", translation_queue.qsize())
         else:
             metrics["dropped"] += 1
-            log.warning("Google translation queue full; dropping phrase")
+            log.error("Google translation queue full (100); phrase was lost")
     loop.call_soon_threadsafe(enqueue)
 
 
@@ -284,7 +286,7 @@ async def start(x_admin_key: str | None = Header(default=None)):
             raise HTTPException(400, "Set TRANSLATION_PROVIDER=google or azure")
         if not configured():
             raise HTTPException(400, "Configure Google Translation key and Azure credentials if using fallback")
-        translation_queue = asyncio.Queue(maxsize=5)
+        translation_queue = asyncio.Queue(maxsize=100)
         worker_task = asyncio.create_task(translation_worker())
         running = True
         try:
