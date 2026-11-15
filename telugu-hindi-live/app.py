@@ -167,12 +167,12 @@ def minute_audio_received(wav: bytes) -> None:
         if running and translation_queue is not None:
             if translation_queue.full():
                 metrics["dropped"] += 1
-                log.error("One-minute summary queue FULL; 60 seconds of speech were lost")
+                log.error("Two-minute summary queue FULL; 120 seconds of speech were lost")
                 asyncio.create_task(publish({"type":"warning",
-                    "message":"Summary backlog full; one minute could not be processed"}))
+                    "message":"Summary backlog full; two minutes could not be processed"}))
             else:
                 translation_queue.put_nowait((wav, time.monotonic()))
-                log.info("Captured real 60-second audio window; queued %d bytes", len(wav))
+                log.info("Captured real 120-second audio window; queued %d bytes", len(wav))
     loop.call_soon_threadsafe(enqueue)
 
 
@@ -215,12 +215,12 @@ async def minute_summary_worker() -> None:
     while True:
         wav, captured_at = await translation_queue.get()
         try:
-            log.info("Processing 60-second Telugu audio window")
+            log.info("Processing 120-second Telugu audio window")
             started = time.monotonic()
             english = await asyncio.to_thread(summarize_telugu_audio, wav)
             metrics["translate_s"] = round(time.monotonic()-started,2)
             if english.strip() == "NO_INTELLIGIBLE_SPEECH":
-                log.info("No intelligible speech in this minute; no TTS audio generated")
+                log.info("No intelligible speech in this two-minute window; no TTS audio generated")
                 continue
             if not english.strip():
                 raise ValueError("Empty English summary")
@@ -237,7 +237,7 @@ async def minute_summary_worker() -> None:
                            "telugu":"","kind":"minute_summary",
                            "audio":base64.b64encode(output).decode("ascii"),
                            "mime":"audio/wav","timing":dict(metrics)})
-            log.info("Minute summary %d: understanding %.2fs, TTS %.2fs, post-capture %.2fs",
+            log.info("Two-minute summary %d: understanding %.2fs, TTS %.2fs, post-capture %.2fs",
                      seq,metrics["translate_s"],metrics["tts_s"],metrics["total_s"])
         except asyncio.CancelledError:
             raise
@@ -262,9 +262,9 @@ async def minute_summary_worker() -> None:
             break
         except Exception as exc:
             metrics["dropped"] += 1
-            log.exception("One-minute summary processing failed")
+            log.exception("Two-minute summary processing failed")
             await publish({"type":"warning",
-                           "message":"Minute summary failed: "+type(exc).__name__+
+                           "message":"Two-minute summary failed: "+type(exc).__name__+
                            ". Check server logs and Gemini API key."})
         finally:
             translation_queue.task_done()
