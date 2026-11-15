@@ -4,12 +4,18 @@ import json
 import os
 from urllib import request, error
 
-def google_english_audio(text: str) -> bytes:
+def google_english_audio(text: str, language: str = "en") -> bytes:
+    if language not in ("en", "hi"):
+        raise ValueError("Unsupported speech language")
     key = os.getenv("GOOGLE_TTS_API_KEY", "").strip() or os.environ["GOOGLE_TRANSLATE_API_KEY"]
+    code = "hi-IN" if language == "hi" else "en-IN"
+    voice = (os.getenv("GOOGLE_HINDI_VOICE", "hi-IN-Standard-A") if language == "hi"
+             else os.getenv("GOOGLE_ENGLISH_VOICE", "en-IN-Standard-A"))
     body = json.dumps({
         "input": {"text": text},
-        "voice": {"languageCode": "en-IN", "name": os.getenv("GOOGLE_ENGLISH_VOICE", "en-IN-Standard-A")},
-        "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 16000,\n                        "speakingRate": float(os.getenv("GOOGLE_TTS_SPEAKING_RATE", "0.85"))}
+        "voice": {"languageCode": code, "name": voice},
+        "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 16000,
+                        "speakingRate": float(os.getenv("GOOGLE_TTS_SPEAKING_RATE", "0.85"))}
     }).encode("utf-8")
     req = request.Request(
         "https://texttospeech.googleapis.com/v1/text:synthesize",
