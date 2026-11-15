@@ -1,4 +1,4 @@
-"""Continuous real-microphone capture in 60-second windows (no invented silence)."""
+"""Continuous real-microphone capture in 120-second windows (no invented silence)."""
 import io
 import logging
 import queue
@@ -11,7 +11,7 @@ log = logging.getLogger("minute-capture")
 RATE = 16000
 CHANNELS = 1
 BLOCK_FRAMES = 3200  # 200 ms
-WINDOW_FRAMES = RATE * 60
+WINDOW_FRAMES = RATE * 120
 
 def wav_bytes(pcm):
     buffer = io.BytesIO()
@@ -76,7 +76,7 @@ class MinuteCapture:
                         continue
                     last_received = time.monotonic()
                     # Blocks are genuine captured PCM. Split exactly on
-                    # 60-second sample boundary; nothing overlaps or repeats.
+                    # 120-second sample boundary; nothing overlaps or repeats.
                     offset = 0
                     while offset < len(block):
                         take = min(len(block)-offset, remaining*2)
