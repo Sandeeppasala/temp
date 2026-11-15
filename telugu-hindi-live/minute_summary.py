@@ -1,4 +1,4 @@
-"""Google Gemini two-minute audio understanding: Telugu audio -> concise English summary."""
+"""Google Gemini two-minute audio understanding: Telugu audio -> English and Hindi summaries."""
 import base64
 import json
 import os
@@ -11,24 +11,23 @@ class GeminiBillingRequired(RuntimeError):
 MODEL_DEFAULT = "gemini-3.8-flash"
 API_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
-def summarize_telugu_audio(wav: bytes) -> str:
+def summarize_telugu_audio(wav: bytes) -> dict[str, str]:
     key = os.getenv("GEMINI_API_KEY", "").strip()
     if not key:
         raise RuntimeError("GEMINI_API_KEY missing: create a Gemini API key and add it to .env")
     model = os.getenv("GEMINI_SUMMARY_MODEL", MODEL_DEFAULT).strip() or MODEL_DEFAULT
     prompt = (
-        "Listen to this roughly two-minute recording of a Telugu spiritual "
-        "workshop talk. Produce a faithful, coherent spoken English SUMMARY "
-        "of what the speaker actually said, about 180-260 words when enough "
-        "speech is present. Preserve essential ideas, people, specific claims, "
-        "qualifications, steps and names (Seth, Jane Roberts, Patriji, "
-        "Brahmarshi Patriji, Seth Wisdom, Pyramid Spiritual Societies Movement). "
-        "Prioritize factual fidelity over eloquence. Do not invent missing "
-        "meaning or assume the speaker said anything from Seth books. "
-        "Use complete, natural sentences suitable for English voice narration. "
-        "Never include preambles, headings or bullet points. "
-        "If the audio has no intelligible Telugu speech, answer exactly "
-        "'NO_INTELLIGIBLE_SPEECH'."
+        "Listen to this roughly two-minute Telugu spiritual workshop recording. "
+        "Summarize what the speaker actually said in BOTH English and Hindi, "
+        "each approximately 180-260 words when enough intelligible speech exists. "
+        "The Hindi must be natural Hindi written in Devanagari script, not transliteration. "
+        "Preserve names and details (Seth, Jane Roberts, Patriji, Brahmarshi Patriji, "
+        "Seth Wisdom, Pyramid Spiritual Societies Movement), without inventing facts. "
+        "Prioritize accuracy over eloquence. Do not add ideas from Seth books. "
+        "Write complete natural sentences suitable for voice narration. "
+        "Return ONLY valid JSON with exactly two string keys: english and hindi. "
+        "No markdown or code fences. If no intelligible Telugu speech exists, "
+        "set BOTH values to NO_INTELLIGIBLE_SPEECH."
     )
     body = {
         "model": model,
@@ -78,4 +77,14 @@ def summarize_telugu_audio(wav: bytes) -> str:
     result = " ".join(chunks).strip()
     if not result:
         raise RuntimeError("Gemini returned no text summary; check model response schema")
-    return result
+    # Require both languages; never send a JSON blob to speech synthesis.
+    try:
+        summaries = json.loads(result)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Gemini did not return valid bilingual summary JSON") from exc
+    if not isinstance(summaries, dict):
+        raise RuntimeError("Gemini bilingual summary must be a JSON object")
+    english, hindi = summaries.get("english"), summaries.get("hindi")
+    if not all(isinstance(v, str) and v.strip() for v in (english, hindi)):
+        raise RuntimeError("Gemini did not return both English and Hindi summaries")
+    return {"en": english.strip(), "hi": hindi.strip()}
