@@ -8,8 +8,8 @@ def google_english_audio(text: str) -> bytes:
     key = os.getenv("GOOGLE_TTS_API_KEY", "").strip() or os.environ["GOOGLE_TRANSLATE_API_KEY"]
     body = json.dumps({
         "input": {"text": text},
-        "voice": {"languageCode": "en-US", "name": os.getenv("GOOGLE_ENGLISH_VOICE", "en-US-Standard-C")},
-        "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 16000}
+        "voice": {"languageCode": "en-IN", "name": os.getenv("GOOGLE_ENGLISH_VOICE", "en-IN-Standard-A")},
+        "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 16000,\n                        "speakingRate": float(os.getenv("GOOGLE_TTS_SPEAKING_RATE", "0.85"))}
     }).encode("utf-8")
     req = request.Request(
         "https://texttospeech.googleapis.com/v1/text:synthesize",
