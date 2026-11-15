@@ -10,13 +10,13 @@ button{border:0;background:#1b6bba;color:white;cursor:pointer}button:disabled{op
 #caption{background:#eaf2fb;padding:16px;border-radius:12px;min-height:70px;font-size:22px}
 small{display:block;margin-top:8px}#status{font-weight:600}
 </style></head><body><main>
-<h1>🎧 English Live</h1><p class="muted">Telugu → English • Spoken meaning summaries every minute</p>
+<h1>🎧 English Live</h1><p class="muted">Telugu → English • Spoken meaning summaries every two minutes</p>
 <label for="code">Event access code</label>
 <div class="row"><input id="code" type="password" autocomplete="off" placeholder="Enter event code">
 <button id="join">Start Listening</button><button id="leave" disabled>Leave</button><button id="unlock" disabled>Resume Audio / Test Beep</button></div>
 <p id="status" role="status">Not connected</p>
 <p>Volume <input type="range" id="volume" min="0" max="100" value="85" aria-label="Volume"></p>
-<p>Playback speed <select id="speed" aria-label="Playback speed"><option value="1">1.0× Natural</option><option value="1.1" selected>1.1× Slightly faster</option><option value="1.2">1.2× Faster</option><option value="1.3">1.3× Fast</option></select></p>
+<p>Playback speed <select id="speed" aria-label="Playback speed"><option value="0.5">0.5× Half speed</option><option value="0.75">0.75× Slower</option><option value="1">1.0× Natural</option><option value="1.1" selected>1.1× Slightly faster</option><option value="1.2">1.2× Faster</option><option value="1.3">1.3× Fast</option></select></p>
 <h2>English interpretation</h2><div id="caption" aria-live="polite">English audio has not started.</div>
 <p class="muted" id="captionNote">Text shown here follows the playback position, not the newest translation.</p>
 <p class="muted" id="latestText">Newest translation: waiting…</p>
