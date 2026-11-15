@@ -43,6 +43,7 @@ ENGLISH_VOICE = os.getenv("ENGLISH_VOICE", "en-US-JennyNeural")
 control_lock = asyncio.Lock()
 loop: Optional[asyncio.AbstractEventLoop] = None
 clients: set[WebSocket] = set()
+client_languages: dict[WebSocket, str] = {}
 running = False
 recognizer = None
 google_mic = None
@@ -115,12 +116,15 @@ async def publish(packet: dict) -> None:
         return
     stale = []
     for ws in list(clients):
+        if packet.get("language") and client_languages.get(ws, "en") != packet["language"]:
+            continue
         try:
             await asyncio.wait_for(ws.send_json(packet), timeout=3)
         except Exception:
             stale.append(ws)
     for ws in stale:
         clients.discard(ws)
+        client_languages.pop(ws, None)
         try:
             await ws.close()
         except Exception:
@@ -217,26 +221,34 @@ async def minute_summary_worker() -> None:
         try:
             log.info("Processing 120-second Telugu audio window")
             started = time.monotonic()
-            english = await asyncio.to_thread(summarize_telugu_audio, wav)
-            metrics["translate_s"] = round(time.monotonic()-started,2)
-            if english.strip() == "NO_INTELLIGIBLE_SPEECH":
+            summaries = await asyncio.to_thread(summarize_telugu_audio, wav)
+            metrics["translate_s"] = round(time.monotonic()-started, 2)
+            if all(value == "NO_INTELLIGIBLE_SPEECH" for value in summaries.values()):
                 log.info("No intelligible speech in this two-minute window; no TTS audio generated")
                 continue
-            if not english.strip():
-                raise ValueError("Empty English summary")
             sequence += 1
             seq = sequence
-            await publish({"type":"caption","seq":seq,"english":english,"telugu":"",
-                           "kind":"minute_summary"})
-            start_tts=time.monotonic()
-            output = await asyncio.to_thread(google_english_audio,english)
-            metrics["tts_s"] = round(time.monotonic()-start_tts,2)
-            metrics["total_s"] = round(time.monotonic()-captured_at,2)
+            for language in ("en", "hi"):
+                summary = summaries[language]
+                if summary == "NO_INTELLIGIBLE_SPEECH":
+                    continue
+                await publish({"type": "caption", "seq": seq, "english": summary,
+                               "language": language, "telugu": "", "kind": "minute_summary"})
+                start_tts = time.monotonic()
+                try:
+                    output = await asyncio.to_thread(google_english_audio, summary, language)
+                except Exception:
+                    log.exception("TTS failed for language %s", language)
+                    await publish({"type": "warning", "language": language,
+                                   "message": "Speech synthesis failed for " + language})
+                    continue
+                metrics["tts_s"] = round(time.monotonic()-start_tts, 2)
+                metrics["total_s"] = round(time.monotonic()-captured_at, 2)
+                await publish({"type": "segment", "seq": seq, "english": summary,
+                               "language": language, "telugu": "", "kind": "minute_summary",
+                               "audio": base64.b64encode(output).decode("ascii"),
+                               "mime": "audio/wav", "timing": dict(metrics)})
             metrics["processed"] += 1
-            await publish({"type":"segment","seq":seq,"english":english,
-                           "telugu":"","kind":"minute_summary",
-                           "audio":base64.b64encode(output).decode("ascii"),
-                           "mime":"audio/wav","timing":dict(metrics)})
             log.info("Two-minute summary %d: understanding %.2fs, TTS %.2fs, post-capture %.2fs",
                      seq,metrics["translate_s"],metrics["tts_s"],metrics["total_s"])
         except asyncio.CancelledError:
@@ -477,15 +489,27 @@ async def test_voice(x_admin_key: str | None = Header(default=None)):
     if not configured():
         raise HTTPException(400, "Configure credentials for selected provider first")
     english = "Hello. The English translation audio test was successful."
-    try:
-        audio = await asyncio.to_thread(google_english_audio if provider == 'google' else synthesize_english, english)
-    except Exception as exc:
-        raise HTTPException(502, f"Audio test failed: {exc}") from exc
+    hindi = "नमस्ते। हिंदी आवाज़ की जाँच सफल रही।"
     sequence += 1
-    await publish({"type": "segment", "seq": sequence, "telugu": "",
-                   "english": english, "mime": "audio/wav",
-                   "audio": base64.b64encode(audio).decode("ascii")})
-    return {"sent": True, "listeners": len(clients), "provider": provider}
+    seq = sequence
+    sent = []
+    for language, sample in (("en", english), ("hi", hindi)):
+        try:
+            if interpretation_mode == "minute_summary":
+                audio = await asyncio.to_thread(google_english_audio, sample, language)
+            else:
+                if language == "hi":
+                    continue
+                audio = await asyncio.to_thread(
+                    google_english_audio if provider == "google" else synthesize_english, sample)
+        except Exception as exc:
+            raise HTTPException(502, f"{language} audio test failed: {exc}") from exc
+        await publish({"type": "segment", "seq": seq, "telugu": "",
+                       "english": sample, "language": language, "mime": "audio/wav",
+                       "audio": base64.b64encode(audio).decode("ascii")})
+        sent.append(language)
+    return {"sent": True, "languages": sent, "listeners": len(clients), "provider": provider}
+
 
 
 @app.websocket("/ws")
@@ -500,11 +524,16 @@ async def listen(ws: WebSocket):
         if len(clients) >= max_listeners:
             await ws.close(code=1013)
             return
+        language = str(msg.get("language", "en"))
+        client_languages[ws] = language if language in ("en", "hi") else "en"
         clients.add(ws)
         await ws.send_json({"type": "status", "running": running})
         while True:
-            await ws.receive_text()
+            message = await ws.receive_json()
+            if message.get("type") == "language" and message.get("language") in ("en", "hi"):
+                client_languages[ws] = message["language"]
     except (WebSocketDisconnect, asyncio.TimeoutError, ValueError):
         pass
     finally:
         clients.discard(ws)
+        client_languages.pop(ws, None)
