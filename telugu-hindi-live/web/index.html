@@ -25,11 +25,21 @@ small{display:block;margin-top:8px}#status{font-weight:600}
 <h2>Live Telugu recognition</h2><div id="teluguLive" style="background:#f0f6f1;padding:16px;border-radius:12px;min-height:70px;font-size:21px" aria-live="polite">Waiting for speech…</div>
 <small id="details" class="muted"></small>
 <p id="diagnostics" class="muted" aria-live="polite">Audio diagnostics: not connected</p>
-<p class="muted">Choose English or Hindi and tap Start Listening. You can use your phone speaker or headphones. Keep this page open and your screen awake. New listeners receive upcoming summaries only.</p>
+<p class="muted">Choose English or Hindi and tap Start Listening. You can use your phone speaker or headphones. For reliable live summaries, keep this page open and your screen awake. Lock-screen playback is experimental on iPhone; Safari may suspend incoming summaries. New listeners receive upcoming summaries only.</p>
 </main><script>
 const $=id=>document.getElementById(id);
 let ws=null,ctx=null,gain=null,epoch=0,nextTime=0;
 let iosAudioElement=null,iosAudioSource=null;
+function configureMediaSession(){
+  if(!('mediaSession' in navigator))return;
+  try{
+    navigator.mediaSession.metadata=new MediaMetadata({title:'Live Telugu Interpretation',artist:'English / Hindi summaries',album:'Workshop interpretation'});
+    navigator.mediaSession.setActionHandler('play',()=>{if(ctx)ctx.resume().catch(()=>{});if(iosAudioElement)iosAudioElement.play().catch(()=>{})});
+    navigator.mediaSession.setActionHandler('pause',()=>{if(iosAudioElement)iosAudioElement.pause()});
+    navigator.mediaSession.playbackState='playing';
+  }catch(e){lastError='Media session: '+e.message}
+}
+
 const isIOS=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
 function configureIOSAudio(){
   if(!isIOS||!ctx||iosAudioElement)return;
@@ -50,6 +60,7 @@ function configureIOSAudio(){
   iosAudioSource=ctx.createMediaElementSource(iosAudioElement);
   iosAudioSource.connect(ctx.destination);
   iosAudioElement.play().catch(e=>{lastError='iOS media unlock: '+e.message;report()});
+  configureMediaSession();
 }
 
 const MAX_SCHEDULED_SECONDS=60;
@@ -77,6 +88,7 @@ function cleanup(){
   if(ws){ws.onclose=null;ws.close();ws=null}
   if(ctx){ctx.close().catch(()=>{});ctx=null}
   if(iosAudioElement){iosAudioElement.pause();URL.revokeObjectURL(iosAudioElement.src);iosAudioElement=null;iosAudioSource=null}
+  if('mediaSession' in navigator)navigator.mediaSession.playbackState='none';
   gain=null;nextTime=0;chain=Promise.resolve();
   received=scheduled=skipped=failed=lastSeq=sequenceGaps=overLimitEvents=0;
   pending=[];pendingSeconds=0;lastError='';
@@ -176,6 +188,8 @@ $('unlock').onclick=async()=>{
   if(!ctx)return;
   try{
     configureIOSAudio();
+    configureMediaSession();
+    if(iosAudioElement&&iosAudioElement.paused)iosAudioElement.play().catch(()=>{});
     await ctx.resume();
     // Audible local tone confirms browser/audio-route availability independently of cloud.
     const osc=ctx.createOscillator(),amp=ctx.createGain();
@@ -232,6 +246,10 @@ $('join').onclick=async()=>{
 };
 $('leave').onclick=()=>{cleanup();status('Disconnected')};
 document.addEventListener('visibilitychange',()=>{
-  if(!document.hidden&&ctx){audioReady();tickPlayback(epoch);report()}
+  if(!document.hidden&&ctx){
+    if(iosAudioElement&&iosAudioElement.paused)iosAudioElement.play().catch(()=>{});
+    audioReady();tickPlayback(epoch);report();
+    if(ws&&ws.readyState!==WebSocket.OPEN)status('Connection interrupted while phone was locked. Tap Leave, then Start Listening.');
+  }
 });
 </script></body></html>
