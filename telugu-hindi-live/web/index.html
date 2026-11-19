@@ -250,45 +250,7 @@ $('join').onclick=async()=>{
     };
     ws.onclose=()=>{if(myEpoch===epoch)status('Audio stream active; captions disconnected. Rejoin to restore captions.')};
     ws.onerror=()=>{if(myEpoch===epoch)status('Captions connection error; audio may continue.')};
-    return;
-    ctx=new (window.AudioContext||window.webkitAudioContext)();
-    gain=ctx.createGain();gain.gain.value=Number($('volume').value)/100;gain.connect(ctx.destination);
-    configureIOSAudio();
-    await ctx.resume();
-    const myEpoch=epoch;
-    ctx.onstatechange=()=>{if(myEpoch===epoch)report()};
-    $('join').disabled=true;$('leave').disabled=false;$('unlock').disabled=false;
-    drainTimer=setInterval(()=>tickPlayback(myEpoch),100);
-    ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
-    status('Connecting…');report();
-    ws.onopen=()=>ws.send(JSON.stringify({type:'auth',code,language:selectedLanguage()}));
-    ws.onmessage=event=>{
-      if(myEpoch!==epoch)return;
-      let msg;try{msg=JSON.parse(event.data)}catch{return}
-      if(msg.type==='status'){status(msg.running?'Connected • translation live':'Connected • waiting for speaker');return}
-      if(msg.type==='warning'){status(msg.message);return}
-      if(msg.type==='partial'){$('teluguLive').textContent=msg.telugu||'';return}
-      if(msg.language&&msg.language!==selectedLanguage())return;
-      if(msg.type==='caption'){
-        $('latestText').textContent='Newest translation #'+msg.seq+': '+(msg.english??'');return;
-      }
-      if(msg.type!=='segment')return;
-      received++;lastPacketAt=Date.now();
-      if(lastSeq && Number.isInteger(msg.seq) && msg.seq>lastSeq+1){
-        sequenceGaps+=msg.seq-lastSeq-1;
-      }
-      if(Number.isInteger(msg.seq))lastSeq=msg.seq;
-      report();
-      // An ordered chain avoids out-of-order decoding/scheduling.
-      chain=chain.then(()=>playPacket(msg,myEpoch)).catch(e=>{
-        failed++;lastError='Audio queue: '+e.message;report();
-      });
-    };
-    ws.onclose=ev=>{
-      if(myEpoch!==epoch)return;
-      cleanup();status(ev.code===1008?'Wrong event code':ev.code===1013?'Event full':'Disconnected. Rejoin.');
-    };
-    ws.onerror=()=>status('WebSocket error. Check the Wi-Fi connection.');
+
   }catch(e){cleanup();status('Cannot start audio: '+e.message)}
 };
 $('leave').onclick=()=>{cleanup();status('Disconnected')};
