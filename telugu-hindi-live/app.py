@@ -4,6 +4,11 @@ Start with: python -m uvicorn app:app --host 127.0.0.1 --port 8000
 Run from this project directory. Never expose the admin key to listeners.
 """
 import asyncio
+import audioop
+import io
+import secrets
+import shutil
+import wave
 import base64
 import hmac
 import html
@@ -23,8 +28,8 @@ from minute_summary import summarize_telugu_audio, GeminiBillingRequired
 from google_tts import google_english_audio
 from terminology import replace_known_names, load_terms
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, Request, Response
+from fastapi.responses import FileResponse, StreamingResponse
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -54,6 +59,117 @@ sequence = 0
 metrics = {"queue_wait_s": 0.0, "translate_s": 0.0, "tts_s": 0.0, "total_s": 0.0, "dropped": 0, "processed": 0}
 speech_health = {"last_partial": 0.0, "last_queued": 0.0, "last_audio_sent": 0.0, "queued_chunks": 0}
 
+
+# Continuous MP3 media stream: HTMLMediaElement remains the playback owner
+# while the phone is locked. Requires ffmpeg on the laptop PATH.
+stream_sessions: dict[str, tuple[str, float]] = {}
+stream_clients: dict[str, set[asyncio.Queue]] = {"en": set(), "hi": set()}
+STREAM_RATE = 16000
+STREAM_TTL = 18 * 3600
+
+def stream_pcm(wav_bytes: bytes) -> bytes:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
+        channels, width, rate = wav.getnchannels(), wav.getsampwidth(), wav.getframerate()
+        if wav.getcomptype() != "NONE":
+            raise ValueError("Compressed WAV is not supported")
+        pcm = wav.readframes(wav.getnframes())
+    if width != 2:
+        pcm = audioop.lin2lin(pcm, width, 2)
+    if channels == 2:
+        pcm = audioop.tomono(pcm, 2, .5, .5)
+    elif channels != 1:
+        raise ValueError("Unsupported channel count")
+    if rate != STREAM_RATE:
+        pcm, _ = audioop.ratecv(pcm, 2, 1, rate, STREAM_RATE, None)
+    return pcm
+
+async def broadcast_stream(language: str, wav_bytes: bytes) -> None:
+    if not stream_clients[language]:
+        return
+    try:
+        pcm = await asyncio.to_thread(stream_pcm, wav_bytes)
+    except Exception:
+        log.exception("Unable to convert TTS WAV to streaming PCM")
+        return
+    for queue in tuple(stream_clients[language]):
+        try:
+            queue.put_nowait(pcm)
+        except asyncio.QueueFull:
+            log.warning("Listener streaming queue full; disconnecting slow stream")
+            stream_clients[language].discard(queue)
+
+@app.post("/api/stream-session")
+async def create_stream_session(request: Request, response: Response):
+    body = await request.json()
+    if not check_secret(str(body.get("code", "")), event_code):
+        raise HTTPException(401, "Invalid event code")
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(503, "Install ffmpeg on the laptop to enable lock-screen streaming")
+    token = secrets.token_urlsafe(32)
+    now = time.monotonic()
+    for old, (_, created) in list(stream_sessions.items()):
+        if now - created > STREAM_TTL:
+            stream_sessions.pop(old, None)
+    stream_sessions[token] = ("listener", now)
+    response.set_cookie("listener_stream", token, httponly=True,
+                        secure=request.url.scheme == "https", samesite="strict",
+                        max_age=STREAM_TTL, path="/")
+    return {"ready": True}
+
+@app.get("/stream/{language}")
+async def continuous_stream(language: str, request: Request):
+    token = request.cookies.get("listener_stream", "")
+    session = stream_sessions.get(token)
+    if not session or time.monotonic() - session[1] > STREAM_TTL:
+        raise HTTPException(401, "Join with your event code first")
+    if language not in ("en", "hi"):
+        raise HTTPException(404, "Unknown language")
+    if sum(map(len, stream_clients.values())) >= max_listeners:
+        raise HTTPException(503, "Audio stream full")
+    queue: asyncio.Queue = asyncio.Queue(maxsize=24)
+    stream_clients[language].add(queue)
+    async def generate():
+        proc = None
+        writer = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "s16le", "-ar", str(STREAM_RATE), "-ac", "1", "-i", "pipe:0",
+                "-codec:a", "libmp3lame", "-b:a", "48k",
+                "-f", "mp3", "-flush_packets", "1", "pipe:1",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL)
+            # Keep the media stream alive with quiet PCM between summaries.
+            async def feed():
+                silence = bytes(STREAM_RATE // 4 * 2)
+                while proc.returncode is None:
+                    try:
+                        pcm = await asyncio.wait_for(queue.get(), timeout=.25)
+                    except asyncio.TimeoutError:
+                        pcm = silence
+                    proc.stdin.write(pcm)
+                    await proc.stdin.drain()
+            writer = asyncio.create_task(feed())
+            while not await request.is_disconnected():
+                chunk = await proc.stdout.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+        except (BrokenPipeError, ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            stream_clients[language].discard(queue)
+            if writer:
+                writer.cancel()
+                try:
+                    await writer
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if proc and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+    return StreamingResponse(generate(), media_type="audio/mpeg",
+        headers={"Cache-Control":"no-store, no-transform", "X-Accel-Buffering":"no"})
 
 def check_secret(given: str, expected: str) -> bool:
     return bool(expected) and hmac.compare_digest(given.encode(), expected.encode())
@@ -244,6 +360,7 @@ async def minute_summary_worker() -> None:
                     continue
                 metrics["tts_s"] = round(time.monotonic()-start_tts, 2)
                 metrics["total_s"] = round(time.monotonic()-captured_at, 2)
+                await broadcast_stream(language, output)
                 await publish({"type": "segment", "seq": seq, "english": summary,
                                "language": language, "telugu": "", "kind": "minute_summary",
                                "audio": base64.b64encode(output).decode("ascii"),
@@ -306,6 +423,7 @@ async def translation_worker() -> None:
             metrics["total_s"] = round(time.monotonic() - received_at, 2)
             metrics["processed"] += 1
             speech_health["last_audio_sent"] = time.monotonic()
+            await broadcast_stream("en", audio)
             await publish({
                 "type": "segment", "seq": seq,
                 "telugu": telugu, "english": english,
@@ -504,6 +622,7 @@ async def test_voice(x_admin_key: str | None = Header(default=None)):
                     google_english_audio if provider == "google" else synthesize_english, sample)
         except Exception as exc:
             raise HTTPException(502, f"{language} audio test failed: {exc}") from exc
+        await broadcast_stream(language, audio)
         await publish({"type": "segment", "seq": seq, "telugu": "",
                        "english": sample, "language": language, "mime": "audio/wav",
                        "audio": base64.b64encode(audio).decode("ascii")})
