@@ -1,4 +1,4 @@
-"""Google Gemini two-minute audio understanding: Telugu audio -> English and Hindi summaries."""
+"""Google Gemini windowed audio understanding: Telugu audio -> English and Hindi summaries."""
 import base64
 import json
 import os
@@ -11,15 +11,16 @@ class GeminiBillingRequired(RuntimeError):
 MODEL_DEFAULT = "gemini-3.8-flash"
 API_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
-def summarize_telugu_audio(wav: bytes) -> dict[str, str]:
+def summarize_telugu_audio(wav: bytes, window_seconds: int = 120, context: str = "") -> dict[str, str]:
     key = os.getenv("GEMINI_API_KEY", "").strip()
     if not key:
         raise RuntimeError("GEMINI_API_KEY missing: create a Gemini API key and add it to .env")
     model = os.getenv("GEMINI_SUMMARY_MODEL", MODEL_DEFAULT).strip() or MODEL_DEFAULT
+    target_words = {30: "35-50", 60: "70-100", 120: "180-260"}.get(window_seconds, "35-50")
     prompt = (
-        "Listen to this roughly two-minute Telugu spiritual workshop recording. "
+        f"Listen to this roughly {window_seconds}-second Telugu spiritual workshop recording. "
         "Convey what was actually said in BOTH English and Hindi, "
-        "each approximately 180-260 words when enough intelligible speech exists. "
+        f"each approximately {target_words} words when enough intelligible speech exists. "
         "The Hindi must be natural Hindi written in Devanagari script, not transliteration. "
         "Preserve names and details (Seth, Jane Roberts, Patriji, Brahmarshi Patriji, "
         "Seth Wisdom, Pyramid Spiritual Societies Movement), without inventing facts. "
@@ -36,6 +37,9 @@ def summarize_telugu_audio(wav: bytes) -> dict[str, str]:
         "No markdown or code fences. If no intelligible Telugu speech exists, "
         "set BOTH values to NO_INTELLIGIBLE_SPEECH."
     )
+    if context:
+        prompt += ("Previous segment context for continuity ONLY (do not repeat it, and do not "
+                   "treat it as audio from this segment): " + context[:600] + "\n")
     body = {
         "model": model,
         "store": False,
