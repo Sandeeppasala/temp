@@ -56,6 +56,8 @@ minute_mic = None
 translation_queue: asyncio.Queue | None = None
 worker_task: asyncio.Task | None = None
 sequence = 0
+summary_window_seconds = 120
+summary_context = ""
 metrics = {"queue_wait_s": 0.0, "translate_s": 0.0, "tts_s": 0.0, "total_s": 0.0, "dropped": 0, "processed": 0}
 speech_health = {"last_partial": 0.0, "last_queued": 0.0, "last_audio_sent": 0.0, "queued_chunks": 0}
 
@@ -287,12 +289,12 @@ def minute_audio_received(wav: bytes) -> None:
         if running and translation_queue is not None:
             if translation_queue.full():
                 metrics["dropped"] += 1
-                log.error("Two-minute summary queue FULL; 120 seconds of speech were lost")
+                log.error("Summary queue FULL; %d seconds of speech were lost", summary_window_seconds)
                 asyncio.create_task(publish({"type":"warning",
-                    "message":"Summary backlog full; two minutes could not be processed"}))
+                    "message":f"Summary backlog full; {summary_window_seconds} seconds could not be processed"}))
             else:
                 translation_queue.put_nowait((wav, time.monotonic()))
-                log.info("Captured real 120-second audio window; queued %d bytes", len(wav))
+                log.info("Captured real %d-second audio window; queued %d bytes", summary_window_seconds, len(wav))
     loop.call_soon_threadsafe(enqueue)
 
 
@@ -330,18 +332,19 @@ def synthesize_english(text: str) -> bytes:
 
 
 async def minute_summary_worker() -> None:
-    global sequence, running, minute_mic
+    global sequence, running, minute_mic, summary_context
     assert translation_queue is not None
     while True:
         wav, captured_at = await translation_queue.get()
         try:
-            log.info("Processing 120-second Telugu audio window")
+            log.info("Processing %d-second Telugu audio window", summary_window_seconds)
             started = time.monotonic()
-            summaries = await asyncio.to_thread(summarize_telugu_audio, wav)
+            summaries = await asyncio.to_thread(summarize_telugu_audio, wav, summary_window_seconds, summary_context)
             metrics["translate_s"] = round(time.monotonic()-started, 2)
             if all(value == "NO_INTELLIGIBLE_SPEECH" for value in summaries.values()):
-                log.info("No intelligible speech in this two-minute window; no TTS audio generated")
+                log.info("No intelligible speech in this window; no TTS audio generated")
                 continue
+            summary_context = summaries.get("en", "")[:600]
             sequence += 1
             seq = sequence
             for language in ("en", "hi"):
@@ -366,7 +369,7 @@ async def minute_summary_worker() -> None:
                                "audio": base64.b64encode(output).decode("ascii"),
                                "mime": "audio/wav", "timing": dict(metrics)})
             metrics["processed"] += 1
-            log.info("Two-minute summary %d: understanding %.2fs, TTS %.2fs, post-capture %.2fs",
+            log.info("Summary %d: understanding %.2fs, TTS %.2fs, post-capture %.2fs",
                      seq,metrics["translate_s"],metrics["tts_s"],metrics["total_s"])
         except asyncio.CancelledError:
             raise
@@ -496,6 +499,7 @@ def status(x_admin_key: str | None = Header(default=None)):
             "provider": provider, "speech_engine": provider, "tts_engine": provider,
             "configured_names": len(load_terms()),
             "interpretation_mode": interpretation_mode,
+            "summary_window_seconds": summary_window_seconds,
             "target_language": TARGET_LANGUAGE,
             "voice": ENGLISH_VOICE, "provider_configured": configured(),
             "metrics": dict(metrics), "queued_phrases": translation_queue.qsize() if translation_queue else 0,
@@ -504,9 +508,23 @@ def status(x_admin_key: str | None = Header(default=None)):
                               "queued_chunks": speech_health["queued_chunks"]}}
 
 
+@app.post("/api/summary-window")
+async def set_summary_window(request: Request, x_admin_key: str | None = Header(default=None)):
+    global summary_window_seconds
+    admin_auth(x_admin_key)
+    body = await request.json()
+    seconds = body.get("seconds")
+    if type(seconds) is not int or seconds not in (30, 60, 120):
+        raise HTTPException(400, "Choose 30, 60, or 120 seconds")
+    async with control_lock:
+        if running:
+            raise HTTPException(409, "Stop the microphone before changing the interval")
+        summary_window_seconds = seconds
+    return {"summary_window_seconds": summary_window_seconds}
+
 @app.post("/api/start")
 async def start(x_admin_key: str | None = Header(default=None)):
-    global running, recognizer, translation_queue, worker_task, google_mic, minute_mic
+    global running, recognizer, translation_queue, worker_task, google_mic, minute_mic, summary_context
     admin_auth(x_admin_key)
     async with control_lock:
         if running:
@@ -521,6 +539,7 @@ async def start(x_admin_key: str | None = Header(default=None)):
             raise HTTPException(400, "Set TRANSLATION_PROVIDER=google or azure")
         if not configured():
             raise HTTPException(400, "For minute summaries set GEMINI_API_KEY and GOOGLE_TTS_API_KEY in .env, then restart the server")
+        summary_context = ""
         translation_queue = asyncio.Queue(maxsize=100 if interpretation_mode=="live" else 12)
         worker_task = asyncio.create_task(
             minute_summary_worker() if interpretation_mode=="minute_summary"
@@ -528,7 +547,7 @@ async def start(x_admin_key: str | None = Header(default=None)):
         running = True
         try:
             if interpretation_mode == "minute_summary":
-                minute_mic = MinuteCapture(minute_audio_received, google_failed)
+                minute_mic = MinuteCapture(minute_audio_received, google_failed, summary_window_seconds)
                 minute_mic.start()
             elif provider == "google":
                 google_mic = GoogleMicrophone(google_recognized, google_failed, google_partial)
