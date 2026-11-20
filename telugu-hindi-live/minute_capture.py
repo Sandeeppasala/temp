@@ -1,4 +1,4 @@
-"""Continuous real-microphone capture in 120-second windows (no invented silence)."""
+"""Continuous real-microphone capture in configurable windows (no invented silence)."""
 import io
 import logging
 import queue
@@ -11,7 +11,6 @@ log = logging.getLogger("minute-capture")
 RATE = 16000
 CHANNELS = 1
 BLOCK_FRAMES = 3200  # 200 ms
-WINDOW_FRAMES = RATE * 120
 
 def wav_bytes(pcm):
     buffer = io.BytesIO()
@@ -23,7 +22,10 @@ def wav_bytes(pcm):
     return buffer.getvalue()
 
 class MinuteCapture:
-    def __init__(self, on_window, on_error):
+    def __init__(self, on_window, on_error, window_seconds=120):
+        if window_seconds not in (30, 60, 120):
+            raise ValueError("Capture interval must be 30, 60, or 120 seconds")
+        self.window_seconds = window_seconds
         self.on_window = on_window
         self.on_error = on_error
         self.stop_event = threading.Event()
@@ -62,7 +64,7 @@ class MinuteCapture:
             with sd.RawInputStream(samplerate=RATE, channels=CHANNELS,
                                    dtype="int16", blocksize=BLOCK_FRAMES,
                                    callback=callback):
-                remaining = WINDOW_FRAMES
+                remaining = RATE * self.window_seconds
                 pcm = bytearray()
                 last_received = time.monotonic()
                 while not self.stop_event.is_set():
@@ -76,7 +78,7 @@ class MinuteCapture:
                         continue
                     last_received = time.monotonic()
                     # Blocks are genuine captured PCM. Split exactly on
-                    # 120-second sample boundary; nothing overlaps or repeats.
+                    # configured sample boundary; nothing overlaps or repeats.
                     offset = 0
                     while offset < len(block):
                         take = min(len(block)-offset, remaining*2)
