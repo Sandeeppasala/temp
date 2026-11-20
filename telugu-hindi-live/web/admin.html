@@ -6,9 +6,10 @@ input,button{font:inherit;padding:12px;border-radius:8px;margin:6px;border:1px s
 input{width:70%}button{cursor:pointer;background:#155fa5;color:white;border:0}
 p{line-height:1.5}code{background:#edf1f5;padding:2px 5px}
 </style></head><body><main>
-<h1>🎙️ Telugu → English — Live or Two-Minute Summary</h1>
-<p>Run this page on your laptop. In default two-minute summary mode, the laptop captures real microphone audio for 120 seconds, summarizes it in English with Gemini, then sends the English voice to listeners. No synthetic silent audio.</p>
+<h1>🎙️ Telugu → English — Live or Configurable Summary</h1>
+<p>Run this page on your laptop. Choose a capture interval below. The laptop captures real Telugu microphone audio, summarizes it in English and Hindi with Gemini, then streams narration to listeners. No synthetic silent audio.</p>
 <label>Administrator key <input id="key" type="password" autocomplete="off"></label>
+<div><label>Summary interval <select id="window" style="font:inherit;padding:10px"><option value="30">30 seconds (recommended)</option><option value="60">60 seconds</option><option value="120" selected>120 seconds (original)</option></select></label><button onclick="setWindow()">Apply interval</button><p>Stop the microphone before changing the interval. The setting resets to 120 seconds after restarting the server.</p></div>
 <div><button onclick="call('/api/start')">Start microphone</button>
 <button onclick="call('/api/stop')">Stop microphone</button>
 <button onclick="call('/api/test')">Send test English voice</button>
@@ -23,6 +24,7 @@ try{
 const r=await fetch(path,{method,headers:{'X-Admin-Key':document.getElementById('key').value}});
 const body=await r.json();out.textContent=JSON.stringify(body,null,2);
 }catch(e){out.textContent=e.message}}
+async function setWindow(){try{const r=await fetch("/api/summary-window",{method:"POST",headers:{"X-Admin-Key":document.getElementById("key").value,"Content-Type":"application/json"},body:JSON.stringify({seconds:Number(document.getElementById("window").value)})});const body=await r.json();out.textContent=JSON.stringify(body,null,2)}catch(e){out.textContent=e.message}}
 function call(p){return request(p,'POST')}
-function refresh(){return request('/api/status')}
+async function refresh(){await request('/api/status');try{const status=JSON.parse(out.textContent);if(status.summary_window_seconds)document.getElementById('window').value=String(status.summary_window_seconds)}catch(e){}}
 </script></body></html>
