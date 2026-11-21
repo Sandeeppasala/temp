@@ -88,7 +88,7 @@ class MinuteCapture:
                         if remaining == 0:
                             self.on_window(wav_bytes(bytes(pcm)))
                             pcm = bytearray()
-                            remaining = WINDOW_FRAMES
+                            remaining = RATE * self.window_seconds
                 if pcm:
                     log.info("Stopped with %.1f seconds of incomplete audio window; not sent",len(pcm)/2/RATE)
         except Exception as exc:
