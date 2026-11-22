@@ -16,7 +16,8 @@ def summarize_telugu_audio(wav: bytes, window_seconds: int = 120, context: str =
     if not key:
         raise RuntimeError("GEMINI_API_KEY missing: create a Gemini API key and add it to .env")
     model = os.getenv("GEMINI_SUMMARY_MODEL", MODEL_DEFAULT).strip() or MODEL_DEFAULT
-    target_words = {30: "35-50", 60: "70-100", 120: "180-260"}.get(window_seconds, "35-50")
+    target_words = ({30: "35-50", 60: "70-100", 120: "180-260"}.get(window_seconds)
+                    or ("8-18" if window_seconds <= 10 else "15-30" if window_seconds <= 20 else "25-40"))
     prompt = (
         f"Listen to this roughly {window_seconds}-second Telugu spiritual workshop recording. "
         "Convey what was actually said in BOTH English and Hindi, "
@@ -32,7 +33,10 @@ def summarize_telugu_audio(wav: bytes, window_seconds: int = 120, context: str =
         "Do not frame the message as commentary about a speaker. "
         "Start directly with the content. Condense faithfully without inventing "
         "personal claims, new teachings, or first-person experiences. "
-        "Write complete natural sentences suitable for voice narration. "
+         "Write complete natural sentences suitable for voice narration. "
+        "Treat the audio as one contiguous new segment; use earlier context only to resolve "
+        "references. Summarize only this segment, never repeat prior summaries. "
+        "If the thought is unfinished, preserve its meaning without inventing a conclusion. "
         "Return ONLY valid JSON with exactly two string keys: english and hindi. "
         "No markdown or code fences. If no intelligible Telugu speech exists, "
         "set BOTH values to NO_INTELLIGIBLE_SPEECH."
