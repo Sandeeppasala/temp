@@ -1,0 +1,30 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Live Translation Control</title><style>
+body{font:16px system-ui;background:#f1f4f8;margin:0;color:#1e293b}
+main{max-width:650px;background:white;padding:24px;border-radius:14px;margin:30px auto}
+input,button{font:inherit;padding:12px;border-radius:8px;margin:6px;border:1px solid #bbc6d0}
+input{width:70%}button{cursor:pointer;background:#155fa5;color:white;border:0}
+p{line-height:1.5}code{background:#edf1f5;padding:2px 5px}
+</style></head><body><main>
+<h1>🎙️ Telugu → English & Hindi Interpretation</h1>
+<p>Continuous Telugu microphone capture with English and Hindi summaries delivered through independent audio pipelines.</p><p id="modeInfo" aria-live="polite">Enter your administrator key and select Status to see the active mode.</p>
+<label>Administrator key <input id="key" type="password" autocomplete="off"></label>
+<div id="fixedWindowControls"><label>Summary interval <select id="window" style="font:inherit;padding:10px"><option value="30">30 seconds (recommended)</option><option value="60">60 seconds</option><option value="120" selected>120 seconds (original)</option></select></label><button onclick="setWindow()">Apply interval</button><p>Only applies to the legacy fixed-window summary mode. Stop the microphone before changing it.</p></div><div id="semanticSettings" style="display:none;background:#edf5fb;padding:14px;border-radius:8px;margin:12px 0"><strong>Continuous pause-aware summarization</strong><p>Minimum segment: 5 seconds · Natural pause: 0.8 seconds · Maximum segment: 18 seconds.</p><p>Audio is segmented at natural pauses; Gemini creates the summary. These thresholds are configured on the server.</p></div>
+<div><button onclick="call('/api/start')">Start microphone</button>
+<button onclick="call('/api/stop')">Stop microphone</button>
+<button onclick="call('/api/test')">Send test English & Hindi voices</button>
+<button onclick="refresh()">Status</button></div>
+<pre id="output" aria-live="polite">Ready</pre>
+<p><strong>Participant link:</strong> <a href="/" target="_blank" rel="noopener" id="link">Open listener page</a></p>
+<p>Share only the participant URL and EVENT_CODE. Never share the administrator key. Use an HTTPS tunnel for remote listeners.</p>
+</main><script>
+const out=document.getElementById('output');
+async function request(path,method='GET'){
+try{
+const r=await fetch(path,{method,headers:{'X-Admin-Key':document.getElementById('key').value}});
+const body=await r.json();out.textContent=JSON.stringify(body,null,2);
+}catch(e){out.textContent=e.message}}
+async function setWindow(){try{const r=await fetch("/api/summary-window",{method:"POST",headers:{"X-Admin-Key":document.getElementById("key").value,"Content-Type":"application/json"},body:JSON.stringify({seconds:Number(document.getElementById("window").value)})});const body=await r.json();out.textContent=JSON.stringify(body,null,2)}catch(e){out.textContent=e.message}}
+function call(p){return request(p,'POST')}
+async function refresh(){await request('/api/status');try{const status=JSON.parse(out.textContent);if(status.summary_window_seconds)document.getElementById('window').value=String(status.summary_window_seconds);const semantic=status.interpretation_mode==='semantic_summary';document.getElementById('fixedWindowControls').style.display=semantic?'none':'';document.getElementById('semanticSettings').style.display=semantic?'block':'none';document.getElementById('modeInfo').textContent=semantic?'Active mode: Continuous pause-aware summarization (English and Hindi).':status.interpretation_mode==='minute_summary'?'Active mode: Fixed-window summarization.':'Active mode: '+(status.interpretation_mode||'unknown')}catch(e){}}
+</script></body></html>
