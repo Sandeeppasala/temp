@@ -65,9 +65,21 @@ def summarize_telugu_audio(wav: bytes, window_seconds: int = 120, context: str =
                 "Check the Gemini API project billing in Google AI Studio. "
                 "Summary capture paused until billing is resolved and restarted."
             ) from None
+        # Surface the provider's actual quota/billing reason without logging
+        # credentials, request headers, or the source audio.
+        reason = ""
+        try:
+            details = json.loads(exc.read(16384).decode("utf-8", errors="replace"))
+            provider_error = details.get("error", {})
+            if isinstance(provider_error, dict):
+                reason = str(provider_error.get("message", ""))[:1000]
+        except (ValueError, UnicodeError, OSError):
+            pass
+        retry_after = exc.headers.get("Retry-After", "")
+        hint = f" Retry-After: {retry_after}s." if retry_after.isdecimal() else ""
         raise RuntimeError(
-            f"Gemini audio summary HTTP {exc.code}; verify API key, "
-            "selected model, project billing and quota"
+            f"Gemini audio summary HTTP {exc.code}: "
+            f"{reason or 'Check model quota and billing.'}{hint}"
         ) from None
     # Interactions API returns an output array of typed text blocks.
     parts = payload.get("outputs") or payload.get("output") or []
