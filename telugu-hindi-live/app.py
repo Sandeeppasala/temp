@@ -332,74 +332,106 @@ def synthesize_english(text: str) -> bytes:
 
 
 async def minute_summary_worker() -> None:
+    """Understand source audio once; deliver each language independently in FIFO order."""
     global sequence, running, minute_mic, summary_context
     assert translation_queue is not None
-    while True:
-        wav, captured_at = await translation_queue.get()
-        try:
-            log.info("Processing %d-second Telugu audio window", summary_window_seconds)
-            started = time.monotonic()
-            summaries = await asyncio.to_thread(summarize_telugu_audio, wav, summary_window_seconds, summary_context)
-            metrics["translate_s"] = round(time.monotonic()-started, 2)
-            if all(value == "NO_INTELLIGIBLE_SPEECH" for value in summaries.values()):
-                log.info("No intelligible speech in this window; no TTS audio generated")
-                continue
-            summary_context = summaries.get("en", "")[:600]
-            sequence += 1
-            seq = sequence
-            for language in ("en", "hi"):
-                summary = summaries[language]
-                if summary == "NO_INTELLIGIBLE_SPEECH":
-                    continue
+    language_queues = {"en": asyncio.Queue(), "hi": asyncio.Queue()}
+
+    async def language_worker(language: str) -> None:
+        queue = language_queues[language]
+        while True:
+            seq, summary, captured_at, translate_seconds = await queue.get()
+            try:
                 await publish({"type": "caption", "seq": seq, "english": summary,
                                "language": language, "telugu": "", "kind": "minute_summary"})
-                start_tts = time.monotonic()
+                started = time.monotonic()
                 try:
                     output = await asyncio.to_thread(google_english_audio, summary, language)
                 except Exception:
-                    log.exception("TTS failed for language %s", language)
+                    log.exception("TTS failed for language %s summary %d", language, seq)
                     await publish({"type": "warning", "language": language,
                                    "message": "Speech synthesis failed for " + language})
                     continue
-                metrics["tts_s"] = round(time.monotonic()-start_tts, 2)
-                metrics["total_s"] = round(time.monotonic()-captured_at, 2)
+                tts_seconds = round(time.monotonic() - started, 2)
+                total_seconds = round(time.monotonic() - captured_at, 2)
                 await broadcast_stream(language, output)
                 await publish({"type": "segment", "seq": seq, "english": summary,
                                "language": language, "telugu": "", "kind": "minute_summary",
                                "audio": base64.b64encode(output).decode("ascii"),
-                               "mime": "audio/wav", "timing": dict(metrics)})
-            metrics["processed"] += 1
-            log.info("Summary %d: understanding %.2fs, TTS %.2fs, post-capture %.2fs",
-                     seq,metrics["translate_s"],metrics["tts_s"],metrics["total_s"])
-        except asyncio.CancelledError:
-            raise
-        except GeminiBillingRequired as exc:
-            metrics["dropped"] += 1
-            running = False
-            log.error("%s", exc)
-            await publish({"type":"warning", "message":str(exc)})
-            await publish({"type":"status", "running":False})
-            if minute_mic:
-                mic = minute_mic
-                minute_mic = None
-                await asyncio.to_thread(mic.stop)
-            # Drain captured audio rather than retaining unprocessable WAVs.
-            while True:
-                try:
-                    translation_queue.get_nowait()
-                    translation_queue.task_done()
-                    metrics["dropped"] += 1
-                except asyncio.QueueEmpty:
-                    break
-            break
-        except Exception as exc:
-            metrics["dropped"] += 1
-            log.exception("Two-minute summary processing failed")
-            await publish({"type":"warning",
-                           "message":"Two-minute summary failed: "+type(exc).__name__+
-                           ". Check server logs and Gemini API key."})
-        finally:
-            translation_queue.task_done()
+                               "mime": "audio/wav",
+                               "timing": {"translate_s": translate_seconds,
+                                          "tts_s": tts_seconds, "total_s": total_seconds}})
+                log.info("%s summary %d: TTS %.2fs, post-capture %.2fs",
+                         language, seq, tts_seconds, total_seconds)
+            finally:
+                queue.task_done()
+
+    language_tasks = [asyncio.create_task(language_worker(lang), name="tts-" + lang)
+                      for lang in ("en", "hi")]
+    try:
+        while True:
+            wav, captured_at = await translation_queue.get()
+            try:
+                metrics["queue_wait_s"] = round(time.monotonic() - captured_at, 2)
+                log.info("Processing %d-second Telugu audio window", summary_window_seconds)
+                started = time.monotonic()
+                summaries = await asyncio.to_thread(
+                    summarize_telugu_audio, wav, summary_window_seconds, summary_context)
+                metrics["translate_s"] = round(time.monotonic() - started, 2)
+                if all(value == "NO_INTELLIGIBLE_SPEECH" for value in summaries.values()):
+                    log.info("No intelligible speech in this window; no TTS audio generated")
+                    continue
+                summary_context = summaries.get("en", "")[:600]
+                sequence += 1
+                seq = sequence
+                for language in ("en", "hi"):
+                    summary = summaries[language]
+                    if summary != "NO_INTELLIGIBLE_SPEECH":
+                        language_queues[language].put_nowait(
+                            (seq, summary, captured_at, metrics["translate_s"]))
+                metrics["processed"] += 1
+                log.info("Summary %d: Gemini %.2fs, EN backlog %d, HI backlog %d",
+                         seq, metrics["translate_s"],
+                         language_queues["en"].qsize(), language_queues["hi"].qsize())
+            except asyncio.CancelledError:
+                raise
+            except GeminiBillingRequired as exc:
+                metrics["dropped"] += 1
+                running = False
+                log.error("%s", exc)
+                await publish({"type": "warning", "message": str(exc)})
+                await publish({"type": "status", "running": False})
+                if minute_mic:
+                    mic = minute_mic
+                    minute_mic = None
+                    await asyncio.to_thread(mic.stop)
+                while True:
+                    try:
+                        translation_queue.get_nowait()
+                        translation_queue.task_done()
+                        metrics["dropped"] += 1
+                    except asyncio.QueueEmpty:
+                        break
+                break
+            except Exception:
+                metrics["dropped"] += 1
+                log.exception("%d-second summary processing failed", summary_window_seconds)
+                await publish({"type": "warning",
+                               "message": "Summary failed. Check Gemini server logs."})
+            finally:
+                translation_queue.task_done()
+    finally:
+        # Give already generated speech a chance to finish on normal shutdown.
+        # Forced cancellation still stops both pipelines promptly.
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(q.join() for q in language_queues.values())),
+                timeout=20)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        for task in language_tasks:
+            task.cancel()
+        await asyncio.gather(*language_tasks, return_exceptions=True)
 
 
 async def translation_worker() -> None:
