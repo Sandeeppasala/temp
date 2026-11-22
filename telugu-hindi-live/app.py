@@ -24,6 +24,7 @@ from urllib import error as urlerror
 import azure.cognitiveservices.speech as speechsdk
 from google_stream import GoogleMicrophone
 from minute_capture import MinuteCapture
+from semantic_capture import SemanticCapture
 from minute_summary import summarize_telugu_audio, GeminiBillingRequired
 from google_tts import google_english_audio
 from terminology import replace_known_names, load_terms
@@ -193,7 +194,7 @@ def google_configured() -> bool:
 
 
 def configured() -> bool:
-    if interpretation_mode == "minute_summary":
+    if interpretation_mode in ("minute_summary", "semantic_summary"):
         return bool(os.getenv("GEMINI_API_KEY", "").strip()) and bool(
             os.getenv("GOOGLE_TTS_API_KEY", "").strip() or GOOGLE_TRANSLATE_KEY)
     return google_configured() and (provider == "google" or (provider == "azure" and azure_configured()))
@@ -294,7 +295,7 @@ def minute_audio_received(wav: bytes) -> None:
                     "message":f"Summary backlog full; {summary_window_seconds} seconds could not be processed"}))
             else:
                 translation_queue.put_nowait((wav, time.monotonic()))
-                log.info("Captured real %d-second audio window; queued %d bytes", summary_window_seconds, len(wav))
+                log.info("Captured real %.1f-second audio segment; queued %d bytes", (len(wav)-44)/32000, len(wav))
     loop.call_soon_threadsafe(enqueue)
 
 
@@ -373,10 +374,10 @@ async def minute_summary_worker() -> None:
             wav, captured_at = await translation_queue.get()
             try:
                 metrics["queue_wait_s"] = round(time.monotonic() - captured_at, 2)
-                log.info("Processing %d-second Telugu audio window", summary_window_seconds)
+                log.info("Processing Telugu audio segment")
                 started = time.monotonic()
                 summaries = await asyncio.to_thread(
-                    summarize_telugu_audio, wav, summary_window_seconds, summary_context)
+                    summarize_telugu_audio, wav, max(1, round((len(wav)-44)/32000)), summary_context)
                 metrics["translate_s"] = round(time.monotonic() - started, 2)
                 if all(value == "NO_INTELLIGIBLE_SPEECH" for value in summaries.values()):
                     log.info("No intelligible speech in this window; no TTS audio generated")
@@ -532,6 +533,8 @@ def status(x_admin_key: str | None = Header(default=None)):
             "configured_names": len(load_terms()),
             "interpretation_mode": interpretation_mode,
             "summary_window_seconds": summary_window_seconds,
+            "semantic_segmentation": {"minimum_seconds": 5, "pause_seconds": 0.8, "maximum_seconds": 18}
+                if interpretation_mode == "semantic_summary" else None,
             "target_language": TARGET_LANGUAGE,
             "voice": ENGLISH_VOICE, "provider_configured": configured(),
             "metrics": dict(metrics), "queued_phrases": translation_queue.qsize() if translation_queue else 0,
@@ -563,9 +566,9 @@ async def start(x_admin_key: str | None = Header(default=None)):
             return {"running": True, "provider": provider}
         if not event_code or event_code == admin_key:
             raise HTTPException(400, "Set distinct EVENT_CODE and ADMIN_KEY in .env")
-        if interpretation_mode not in ("minute_summary","live"):
-            raise HTTPException(400, "INTERPRETATION_MODE must be minute_summary or live")
-        if interpretation_mode == "minute_summary" and provider != "google":
+        if interpretation_mode not in ("minute_summary","semantic_summary","live"):
+            raise HTTPException(400, "INTERPRETATION_MODE must be minute_summary, semantic_summary or live")
+        if interpretation_mode in ("minute_summary", "semantic_summary") and provider != "google":
             raise HTTPException(400, "Minute summary mode requires TRANSLATION_PROVIDER=google")
         if provider not in ("azure", "google"):
             raise HTTPException(400, "Set TRANSLATION_PROVIDER=google or azure")
@@ -574,12 +577,14 @@ async def start(x_admin_key: str | None = Header(default=None)):
         summary_context = ""
         translation_queue = asyncio.Queue(maxsize=100 if interpretation_mode=="live" else 12)
         worker_task = asyncio.create_task(
-            minute_summary_worker() if interpretation_mode=="minute_summary"
+            minute_summary_worker() if interpretation_mode in ("minute_summary","semantic_summary")
             else translation_worker())
         running = True
         try:
-            if interpretation_mode == "minute_summary":
-                minute_mic = MinuteCapture(minute_audio_received, google_failed, summary_window_seconds)
+            if interpretation_mode in ("minute_summary", "semantic_summary"):
+                minute_mic = (SemanticCapture(minute_audio_received, google_failed, 5.0, 0.8, 18.0)
+                              if interpretation_mode == "semantic_summary"
+                              else MinuteCapture(minute_audio_received, google_failed, summary_window_seconds))
                 minute_mic.start()
             elif provider == "google":
                 google_mic = GoogleMicrophone(google_recognized, google_failed, google_partial)
@@ -664,7 +669,7 @@ async def test_voice(x_admin_key: str | None = Header(default=None)):
     sent = []
     for language, sample in (("en", english), ("hi", hindi)):
         try:
-            if interpretation_mode == "minute_summary":
+            if interpretation_mode in ("minute_summary", "semantic_summary"):
                 audio = await asyncio.to_thread(google_english_audio, sample, language)
             else:
                 if language == "hi":
