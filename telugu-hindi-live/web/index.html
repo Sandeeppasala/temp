@@ -11,7 +11,7 @@ button{border:0;background:#1b6bba;color:white;cursor:pointer}button:disabled{op
 #caption{background:#eaf2fb;padding:16px;border-radius:12px;min-height:70px;font-size:22px}
 small{display:block;margin-top:8px}#status{font-weight:600}
 </style></head><body><main>
-<h1>🎧 Live Interpretation</h1><p class="muted">Telugu → English / हिन्दी • Spoken summaries every two minutes</p>
+<h1>🎧 Live Interpretation</h1><p class="muted">Telugu → English / हिन्दी • Live audio interpretation</p>
 <label for="code">Event access code</label>
 <div class="row"><input id="code" type="password" autocomplete="off" placeholder="Enter event code">
 <button id="join">Start Listening</button><button id="leave" disabled>Leave</button><button id="unlock" disabled>Resume Audio / Test Beep</button></div>
@@ -20,9 +20,9 @@ small{display:block;margin-top:8px}#status{font-weight:600}
 <p><label for="language">Summary language</label> <select id="language" aria-label="Summary language"><option value="en">English</option><option value="hi">हिन्दी (Hindi)</option></select></p>
 <p>Volume <input type="range" id="volume" min="0" max="100" value="85" aria-label="Volume"></p>
 <p>Playback speed <select id="speed" aria-label="Playback speed"><option value="0.5">0.5× Half speed</option><option value="0.75">0.75× Slower</option><option value="1" selected>1.0× Natural</option><option value="1.1">1.1× Slightly faster</option><option value="1.2">1.2× Faster</option><option value="1.3">1.3× Fast</option></select></p>
-<h2 id="summaryHeading">English interpretation</h2><div id="caption" aria-live="polite">English audio has not started.</div>
-<p class="muted" id="captionNote">Text shown here follows the playback position, not the newest translation.</p>
-<p class="muted" id="latestText">Newest translation: waiting…</p>
+<div id="caption" hidden aria-live="off"></div>
+
+<p id="latestText" hidden></p>
 <h2>Live Telugu recognition</h2><div id="teluguLive" style="background:#f0f6f1;padding:16px;border-radius:12px;min-height:70px;font-size:21px" aria-live="polite">Waiting for speech…</div>
 <small id="details" class="muted"></small>
 <p id="diagnostics" class="muted" aria-live="polite">Audio diagnostics: not connected</p>
@@ -180,7 +180,6 @@ async function playPacket(msg,myEpoch){
 }
 $('language').onchange=()=>{
   const lang=selectedLanguage();
-  $('summaryHeading').textContent=lang==='hi'?'हिन्दी सारांश':'English interpretation';
   $('caption').textContent='Waiting for the next '+(lang==='hi'?'Hindi':'English')+' summary…';
   $('latestText').textContent='Newest summary: waiting…';
   // Existing scheduled audio is in the previous language; rejoin to clear it.
