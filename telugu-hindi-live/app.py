@@ -333,10 +333,21 @@ def synthesize_english(text: str) -> bytes:
 
 
 async def minute_summary_worker() -> None:
-    """Understand source audio once; deliver each language independently in FIFO order."""
+    """Two concurrent Gemini calls; publish results in capture order to independent TTS FIFOs.
+
+    A failed request still occupies its ordered slot, so later summaries never
+    overtake earlier ones. Parallel requests use the last *delivered* summary
+    for context (not an unfinished predecessor).
+    """
     global sequence, running, minute_mic, summary_context
     assert translation_queue is not None
     language_queues = {"en": asyncio.Queue(), "hi": asyncio.Queue()}
+    completed = asyncio.Queue()
+    in_flight = {}
+    pending = {}
+    next_capture = 0
+    next_delivery = 0
+    stopping = False
 
     async def language_worker(language: str) -> None:
         queue = language_queues[language]
@@ -367,20 +378,80 @@ async def minute_summary_worker() -> None:
             finally:
                 queue.task_done()
 
+    async def gemini_job(index, wav, captured_at, context):
+        started = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                summarize_telugu_audio, wav, max(1, round((len(wav)-44)/32000)), context)
+            await completed.put((index, captured_at, round(time.monotonic()-started, 2), result, None))
+        except Exception as exc:
+            await completed.put((index, captured_at, round(time.monotonic()-started, 2), None, exc))
+
     language_tasks = [asyncio.create_task(language_worker(lang), name="tts-" + lang)
                       for lang in ("en", "hi")]
     try:
         while True:
-            wav, captured_at = await translation_queue.get()
-            try:
-                metrics["queue_wait_s"] = round(time.monotonic() - captured_at, 2)
-                log.info("Processing Telugu audio segment")
-                started = time.monotonic()
-                summaries = await asyncio.to_thread(
-                    summarize_telugu_audio, wav, max(1, round((len(wav)-44)/32000)), summary_context)
-                metrics["translate_s"] = round(time.monotonic() - started, 2)
-                if all(value == "NO_INTELLIGIBLE_SPEECH" for value in summaries.values()):
-                    log.info("No intelligible speech in this window; no TTS audio generated")
+            # Dispatch no more than two Gemini requests at a time.
+            while not stopping and len(in_flight) < 2:
+                try:
+                    wav, captured_at = translation_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                index = next_capture
+                next_capture += 1
+                metrics["queue_wait_s"] = round(time.monotonic()-captured_at, 2)
+                task = asyncio.create_task(
+                    gemini_job(index, wav, captured_at, summary_context),
+                    name="gemini-" + str(index))
+                in_flight[index] = task
+                log.info("Gemini request %d started; active %d, capture backlog %d",
+                         index, len(in_flight), translation_queue.qsize())
+
+            if stopping and not in_flight:
+                break
+            if not in_flight:
+                # Wait for new source audio, without busy-looping.
+                wav, captured_at = await translation_queue.get()
+                index = next_capture
+                next_capture += 1
+                metrics["queue_wait_s"] = round(time.monotonic()-captured_at, 2)
+                in_flight[index] = asyncio.create_task(
+                    gemini_job(index, wav, captured_at, summary_context),
+                    name="gemini-" + str(index))
+                continue
+
+            # Wait briefly to dispatch new capture as soon as a slot opens.
+            index, captured_at, gemini_seconds, summaries, failure = await completed.get()
+            task = in_flight.pop(index)
+            await task
+            pending[index] = (captured_at, gemini_seconds, summaries, failure)
+            translation_queue.task_done()
+            completed.task_done()
+
+            # Gemini responses may arrive out of order. Never reorder speech.
+            while next_delivery in pending:
+                captured_at, gemini_seconds, summaries, failure = pending.pop(next_delivery)
+                next_delivery += 1
+                metrics["translate_s"] = gemini_seconds
+                if failure is not None:
+                    metrics["dropped"] += 1
+                    if isinstance(failure, GeminiBillingRequired):
+                        running = False
+                        stopping = True
+                        log.error("%s", failure)
+                        await publish({"type": "warning", "message": str(failure)})
+                        await publish({"type": "status", "running": False})
+                        if minute_mic:
+                            mic = minute_mic
+                            minute_mic = None
+                            await asyncio.to_thread(mic.stop)
+                    else:
+                        log.error("Gemini segment %d failed: %s", next_delivery-1, failure)
+                        await publish({"type": "warning",
+                                       "message": "Summary failed. Check Gemini server logs."})
+                    continue
+                if all(v == "NO_INTELLIGIBLE_SPEECH" for v in summaries.values()):
+                    log.info("No intelligible speech for segment %d", next_delivery-1)
                     continue
                 summary_context = summaries.get("en", "")[:600]
                 sequence += 1
@@ -389,23 +460,13 @@ async def minute_summary_worker() -> None:
                     summary = summaries[language]
                     if summary != "NO_INTELLIGIBLE_SPEECH":
                         language_queues[language].put_nowait(
-                            (seq, summary, captured_at, metrics["translate_s"]))
+                            (seq, summary, captured_at, gemini_seconds))
                 metrics["processed"] += 1
                 log.info("Summary %d: Gemini %.2fs, EN backlog %d, HI backlog %d",
-                         seq, metrics["translate_s"],
+                         seq, gemini_seconds,
                          language_queues["en"].qsize(), language_queues["hi"].qsize())
-            except asyncio.CancelledError:
-                raise
-            except GeminiBillingRequired as exc:
-                metrics["dropped"] += 1
-                running = False
-                log.error("%s", exc)
-                await publish({"type": "warning", "message": str(exc)})
-                await publish({"type": "status", "running": False})
-                if minute_mic:
-                    mic = minute_mic
-                    minute_mic = None
-                    await asyncio.to_thread(mic.stop)
+            if stopping:
+                # Stop accepting audio after a non-retryable billing failure.
                 while True:
                     try:
                         translation_queue.get_nowait()
@@ -413,17 +474,14 @@ async def minute_summary_worker() -> None:
                         metrics["dropped"] += 1
                     except asyncio.QueueEmpty:
                         break
-                break
-            except Exception:
-                metrics["dropped"] += 1
-                log.exception("%d-second summary processing failed", summary_window_seconds)
-                await publish({"type": "warning",
-                               "message": "Summary failed. Check Gemini server logs."})
-            finally:
-                translation_queue.task_done()
     finally:
-        # Give already generated speech a chance to finish on normal shutdown.
-        # Forced cancellation still stops both pipelines promptly.
+        # Stop may cancel this worker after its queue has drained; ensure
+        # all in-flight jobs are canceled and accounted for.
+        for task in in_flight.values():
+            task.cancel()
+        await asyncio.gather(*in_flight.values(), return_exceptions=True)
+        for _ in in_flight:
+            translation_queue.task_done()
         try:
             await asyncio.wait_for(
                 asyncio.gather(*(q.join() for q in language_queues.values())),
