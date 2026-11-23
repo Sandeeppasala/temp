@@ -575,6 +575,7 @@ def status(x_admin_key: str | None = Header(default=None)):
             "target_language": TARGET_LANGUAGE,
             "voice": ENGLISH_VOICE, "provider_configured": configured(),
             "metrics": dict(metrics), "queued_phrases": translation_queue.qsize() if translation_queue else 0,
+            "audio_streams": {lang: stream.stats() for lang, stream in shared_streams.items()},
             "speech_health": {**{k+"_age_s": round(time.monotonic()-v, 1) if v else None
                                for k,v in speech_health.items() if k.startswith("last_")},
                               "queued_chunks": speech_health["queued_chunks"]}}
