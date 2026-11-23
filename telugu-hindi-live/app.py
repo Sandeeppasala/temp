@@ -25,6 +25,7 @@ import azure.cognitiveservices.speech as speechsdk
 from google_stream import GoogleMicrophone
 from minute_capture import MinuteCapture
 from semantic_capture import SemanticCapture
+from shared_mp3 import SharedMP3
 from minute_summary import summarize_telugu_audio, GeminiBillingRequired
 from google_tts import google_english_audio
 from terminology import replace_known_names, load_terms
@@ -66,7 +67,7 @@ speech_health = {"last_partial": 0.0, "last_queued": 0.0, "last_audio_sent": 0.0
 # Continuous MP3 media stream: HTMLMediaElement remains the playback owner
 # while the phone is locked. Requires ffmpeg on the laptop PATH.
 stream_sessions: dict[str, tuple[str, float]] = {}
-stream_clients: dict[str, set[asyncio.Queue]] = {"en": set(), "hi": set()}
+shared_streams = {"en": SharedMP3("en"), "hi": SharedMP3("hi")}
 STREAM_RATE = 16000
 STREAM_TTL = 18 * 3600
 
@@ -87,19 +88,17 @@ def stream_pcm(wav_bytes: bytes) -> bytes:
     return pcm
 
 async def broadcast_stream(language: str, wav_bytes: bytes) -> None:
-    if not stream_clients[language]:
+    stream = shared_streams[language]
+    if not stream.clients:
         return
     try:
         pcm = await asyncio.to_thread(stream_pcm, wav_bytes)
+        stream.enqueue(pcm)
+        log.info("%s audio queued: %.1fs PCM, pending %.1fs, dropped %.1fs",
+                 language, len(pcm)/(STREAM_RATE*2),
+                 stream.pcm_bytes/(STREAM_RATE*2), stream.dropped_seconds)
     except Exception:
         log.exception("Unable to convert TTS WAV to streaming PCM")
-        return
-    for queue in tuple(stream_clients[language]):
-        try:
-            queue.put_nowait(pcm)
-        except asyncio.QueueFull:
-            log.warning("Listener streaming queue full; disconnecting slow stream")
-            stream_clients[language].discard(queue)
 
 @app.post("/api/stream-session")
 async def create_stream_session(request: Request, response: Response):
@@ -125,52 +124,31 @@ async def continuous_stream(language: str, request: Request):
     session = stream_sessions.get(token)
     if not session or time.monotonic() - session[1] > STREAM_TTL:
         raise HTTPException(401, "Join with your event code first")
-    if language not in ("en", "hi"):
+    if language not in shared_streams:
         raise HTTPException(404, "Unknown language")
-    if sum(map(len, stream_clients.values())) >= max_listeners:
+    if sum(len(stream.clients) for stream in shared_streams.values()) >= max_listeners:
         raise HTTPException(503, "Audio stream full")
-    queue: asyncio.Queue = asyncio.Queue(maxsize=24)
-    stream_clients[language].add(queue)
+    stream = shared_streams[language]
+    try:
+        queue = await stream.subscribe()
+    except Exception as exc:
+        log.exception("Unable to start shared MP3 encoder")
+        raise HTTPException(503, "Audio encoder unavailable") from exc
+
     async def generate():
-        proc = None
-        writer = None
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-f", "s16le", "-ar", str(STREAM_RATE), "-ac", "1", "-i", "pipe:0",
-                "-codec:a", "libmp3lame", "-b:a", "48k",
-                "-f", "mp3", "-flush_packets", "1", "pipe:1",
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL)
-            # Keep the media stream alive with quiet PCM between summaries.
-            async def feed():
-                silence = bytes(STREAM_RATE // 4 * 2)
-                while proc.returncode is None:
-                    try:
-                        pcm = await asyncio.wait_for(queue.get(), timeout=.25)
-                    except asyncio.TimeoutError:
-                        pcm = silence
-                    proc.stdin.write(pcm)
-                    await proc.stdin.drain()
-            writer = asyncio.create_task(feed())
-            while not await request.is_disconnected():
-                chunk = await proc.stdout.read(4096)
-                if not chunk:
+            while queue in stream.clients and stream.running:
+                if await request.is_disconnected():
                     break
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
                 yield chunk
-        except (BrokenPipeError, ConnectionResetError, asyncio.CancelledError):
+        except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
-            stream_clients[language].discard(queue)
-            if writer:
-                writer.cancel()
-                try:
-                    await writer
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if proc and proc.returncode is None:
-                proc.kill()
-                await proc.wait()
+            stream.unsubscribe(queue)
     return StreamingResponse(generate(), media_type="audio/mpeg",
         headers={"Cache-Control":"no-store, no-transform", "X-Accel-Buffering":"no"})
 
@@ -547,6 +525,7 @@ async def startup() -> None:
 @app.on_event("shutdown")
 async def shutdown() -> None:
     global running, recognizer, worker_task, google_mic, minute_mic
+    await asyncio.gather(*(stream.close() for stream in shared_streams.values()))
     running = False
     if minute_mic:
         await asyncio.to_thread(minute_mic.stop)
