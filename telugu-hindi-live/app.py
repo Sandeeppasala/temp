@@ -165,10 +165,13 @@ async def continuous_stream(language: str, request: Request):
                 async def write_frame(frame):
                     nonlocal deadline, diag_last, pcm_seconds, last_pcm_seconds
                     nonlocal pipe_seconds, pipe_max, reset_seconds, active_remaining
-                    # Do not burst to catch up after a blocked pipe or event-loop stall.
+                    # Keep the cumulative clock through ordinary scheduler jitter.
+                    # Rebase after a significant stall to bound catch-up bursts.
                     now = time.monotonic()
-                    reset_seconds += max(0.0, now - deadline)
-                    deadline = max(deadline, now)
+                    lateness = now - deadline
+                    if lateness >= 0.05:
+                        reset_seconds += lateness
+                        deadline = now
                     pipe_start = time.monotonic()
                     proc.stdin.write(frame)
                     await proc.stdin.drain()
