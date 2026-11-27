@@ -15,10 +15,7 @@ SLICE_MS = 100
 SLICE_BYTES = RATE * 2 * SLICE_MS // 1000
 MAX_PCM_SECONDS = float(os.getenv("STREAM_MAX_PCM_BACKLOG_S", "20"))
 MAX_PCM_BYTES = int(MAX_PCM_SECONDS * RATE * 2)
-STREAM_MODE = os.getenv("STREAM_DELIVERY_MODE", "burst").strip().lower()
-if STREAM_MODE not in ("burst", "paced"):
-    raise ValueError("STREAM_DELIVERY_MODE must be burst or paced")
-MAX_CLIENT_CHUNKS = 256 if STREAM_MODE == "burst" else 32
+MAX_CLIENT_CHUNKS = 32
 
 class SharedMP3:
     def __init__(self, language):
@@ -32,8 +29,6 @@ class SharedMP3:
         self.lock = asyncio.Lock()
         self.running = False
         self.last_encoded_at = 0.0
-        self.wakeup = asyncio.Event()
-        self.silence_seconds = 0.0
 
     async def start(self):
         async with self.lock:
@@ -47,7 +42,7 @@ class SharedMP3:
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL)
             self.running = True
-            self.tasks = [asyncio.create_task((self._feed_burst() if STREAM_MODE == "burst" else self._feed()), name="mp3-feed-"+self.language),
+            self.tasks = [asyncio.create_task(self._feed(), name="mp3-feed-"+self.language),
                           asyncio.create_task(self._broadcast(), name="mp3-read-"+self.language)]
 
     def enqueue(self, pcm):
@@ -55,7 +50,6 @@ class SharedMP3:
             return
         self.pcm.append(memoryview(pcm))
         self.pcm_bytes += len(pcm)
-        self.wakeup.set()
         # Explicit live catch-up policy; never silently discard speech.
         while self.pcm_bytes > MAX_PCM_BYTES and self.pcm:
             old = self.pcm.popleft()
@@ -72,32 +66,6 @@ class SharedMP3:
 
     def unsubscribe(self, q):
         self.clients.discard(q)
-
-    async def _feed_burst(self):
-        """Deliver queued speech immediately; send quiet keepalive on idle."""
-        silence = bytes(RATE * 2 // 4)
-        try:
-            while self.running:
-                if not self.pcm:
-                    self.wakeup.clear()
-                    try:
-                        await asyncio.wait_for(self.wakeup.wait(), timeout=0.25)
-                    except asyncio.TimeoutError:
-                        if not self.pcm:
-                            self.proc.stdin.write(silence)
-                            await self.proc.stdin.drain()
-                            self.silence_seconds += 0.25
-                    continue
-                head = self.pcm.popleft()
-                self.pcm_bytes -= len(head)
-                self.proc.stdin.write(head)
-                await self.proc.stdin.drain()
-                await asyncio.sleep(0)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("%s burst MP3 feeder failed", self.language)
-            self.running = False
 
     async def _feed(self):
         deadline = time.monotonic()
@@ -156,9 +124,7 @@ class SharedMP3:
     def stats(self):
         return {"listeners":len(self.clients), "pcm_backlog_s":round(self.pcm_bytes/(RATE*2),2),
                 "dropped_audio_s":round(self.dropped_seconds,2),
-                "encoder_running":self.running, "delivery_mode":STREAM_MODE,
-                "burst_silence_s":round(self.silence_seconds,2),
-                "last_encoded_age_s":round(time.monotonic()-self.last_encoded_at,2) if self.last_encoded_at else None}
+                "encoder_running":self.running}
 
     async def close(self):
         self.running = False
