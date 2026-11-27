@@ -455,8 +455,16 @@ async def minute_summary_worker() -> None:
                     name="gemini-" + str(index))
                 continue
 
-            # Wait briefly to dispatch new capture as soon as a slot opens.
-            index, captured_at, gemini_seconds, summaries, failure = await completed.get()
+            # With a free slot, recheck source audio every 50 ms rather than
+            # waiting indefinitely for the active request to complete.
+            if not stopping and len(in_flight) < 2:
+                try:
+                    result = await asyncio.wait_for(completed.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    continue
+            else:
+                result = await completed.get()
+            index, captured_at, gemini_seconds, summaries, failure = result
             task = in_flight.pop(index)
             await task
             pending[index] = (captured_at, gemini_seconds, summaries, failure)
