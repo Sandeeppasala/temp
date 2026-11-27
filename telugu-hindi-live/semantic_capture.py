@@ -53,13 +53,56 @@ class SemanticCapture:
         dropped = 0
         last_received = time.monotonic()
         frame_s = BLOCK_FRAMES / RATE
+        # Diagnostic counters only; callback never performs diagnostic logging.
+        callback_count = 0
+        callback_samples = 0
+        callback_last = None
+        callback_max_gap = 0.0
+        received_samples = 0
+        discarded_samples = 0
+        emitted_samples = 0
+        rms_sum = 0
+        rms_count = 0
+        rms_min = None
+        rms_max = 0
+        peak_depth = 0
+        report_at = time.monotonic()
+        previous_counts = (0, 0, 0, 0, 0, 0)
+
+        def report():
+            nonlocal report_at, previous_counts, rms_sum, rms_count, rms_min, rms_max, peak_depth
+            now = time.monotonic()
+            elapsed = now - report_at
+            if elapsed < 5:
+                return
+            counts = (callback_count, callback_samples, received_samples,
+                      discarded_samples, emitted_samples, dropped)
+            delta = tuple(a-b for a,b in zip(counts, previous_counts))
+            log.info("DIAG capture wall_s=%.2f callbacks=%d callback_audio_s=%.2f received_s=%.2f vad_discard_s=%.2f emitted_s=%.2f overflow_blocks=%d rms_min=%s rms_avg=%.1f rms_max=%d threshold=%.1f noise_floor=%.1f callback_max_gap_s=%.3f callback_age_s=%.3f queue_depth=%d peak_depth=%d buffered_s=%.2f",
+                     elapsed, delta[0], delta[1]/RATE, delta[2]/RATE,
+                     delta[3]/RATE, delta[4]/RATE, delta[5],
+                     rms_min, rms_sum/max(1,rms_count), rms_max,
+                     max(240.0, noise_floor*3.0), noise_floor, callback_max_gap,
+                     now-callback_last if callback_last is not None else -1.0,
+                     blocks.qsize(), peak_depth,
+                     (len(pcm)+sum(map(len,pending)))/(RATE*2))
+            previous_counts = counts
+            report_at = now
+            rms_sum = rms_count = rms_max = peak_depth = 0
+            rms_min = None
 
         def callback(indata, frames, time_info, status):
-            nonlocal dropped
+            nonlocal dropped, callback_count, callback_samples, callback_last, callback_max_gap
             if status:
                 log.warning("Microphone status: %s", status)
             if self.stop_event.is_set():
                 return
+            now = time.monotonic()
+            if callback_last is not None:
+                callback_max_gap = max(callback_max_gap, now-callback_last)
+            callback_last = now
+            callback_count += 1
+            callback_samples += frames
             try:
                 blocks.put_nowait(bytes(indata))
             except queue.Full:
@@ -68,10 +111,11 @@ class SemanticCapture:
                     self.on_error("Microphone overflow: source audio lost")
 
         def emit():
-            nonlocal pcm, has_speech, quiet_frames
+            nonlocal pcm, has_speech, quiet_frames, emitted_samples
             if has_speech and pcm:
                 duration = len(pcm) / (RATE * 2)
                 self.on_window(wav_bytes(bytes(pcm)))
+                emitted_samples += len(pcm)//2
                 log.info("Emitted %.1fs real audio at natural pause or maximum duration", duration)
             pcm = bytearray()
             has_speech = False
@@ -84,19 +128,29 @@ class SemanticCapture:
                     try:
                         block = blocks.get(timeout=0.2)
                     except queue.Empty:
+                        report()
                         if time.monotonic() - last_received > 2:
                             self.on_error("Microphone stalled: no audio samples received")
                             last_received = time.monotonic()
                         continue
                     last_received = time.monotonic()
+                    received_samples += len(block)//2
+                    peak_depth = max(peak_depth, blocks.qsize()+1)
                     rms = audioop.rms(block, 2)
+                    rms_sum += rms
+                    rms_count += 1
+                    rms_min = rms if rms_min is None else min(rms_min, rms)
+                    rms_max = max(rms_max, rms)
                     threshold = max(240.0, noise_floor * 3.0)
                     speech = rms >= threshold
                     if not speech:
                         noise_floor = 0.985 * noise_floor + 0.015 * rms
                     if not has_speech:
                         if not speech:
+                            if len(pending) == pending.maxlen:
+                                discarded_samples += len(pending[0])//2
                             pending.append(block)
+                            report()
                             continue
                         # Include pre-roll, but never reuse it in another segment.
                         pcm.extend(b"".join(pending))
@@ -109,6 +163,7 @@ class SemanticCapture:
                         duration >= self.min_seconds
                         and quiet_frames * frame_s >= self.pause_seconds):
                         emit()
+                    report()
                 # Flush real speech on stop, even if shorter than minimum.
                 emit()
         except Exception as exc:
