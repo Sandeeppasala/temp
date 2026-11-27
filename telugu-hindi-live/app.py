@@ -94,9 +94,11 @@ async def broadcast_stream(language: str, wav_bytes: bytes) -> None:
     except Exception:
         log.exception("Unable to convert TTS WAV to streaming PCM")
         return
+    log.info("DIAG broadcast lang=%s pcm_s=%.3f clients=%d", language, len(pcm)/(STREAM_RATE*2), len(stream_clients[language]))
     for queue in tuple(stream_clients[language]):
         try:
             queue.put_nowait(pcm)
+            log.info("DIAG enqueue lang=%s stream=%x depth=%d", language, id(queue), queue.qsize())
         except asyncio.QueueFull:
             log.warning("Listener streaming queue full; disconnecting slow stream")
             stream_clients[language].discard(queue)
@@ -145,11 +147,19 @@ async def continuous_stream(language: str, request: Request):
             # Keep the media stream alive with quiet PCM between summaries.
             async def feed():
                 silence = bytes(STREAM_RATE // 4 * 2)
+                silent_chunks = 0
+                last_report = time.monotonic()
                 while proc.returncode is None:
                     try:
                         pcm = await asyncio.wait_for(queue.get(), timeout=.25)
+                        log.info("DIAG feed lang=%s stream=%x speech_s=%.3f preceding_silence_s=%.2f depth=%d", language, id(queue), len(pcm)/(STREAM_RATE*2), silent_chunks*.25, queue.qsize())
+                        silent_chunks = 0
                     except asyncio.TimeoutError:
                         pcm = silence
+                        silent_chunks += 1
+                        if time.monotonic() - last_report >= 5:
+                            log.info("DIAG starvation lang=%s stream=%x pending_silence_s=%.2f depth=%d", language, id(queue), silent_chunks*.25, queue.qsize())
+                            last_report = time.monotonic()
                     proc.stdin.write(pcm)
                     await proc.stdin.drain()
             writer = asyncio.create_task(feed())
@@ -351,6 +361,7 @@ async def minute_summary_worker() -> None:
 
     async def language_worker(language: str) -> None:
         queue = language_queues[language]
+        previous_ready = None
         while True:
             seq, summary, captured_at, translate_seconds = await queue.get()
             try:
@@ -366,6 +377,14 @@ async def minute_summary_worker() -> None:
                     continue
                 tts_seconds = round(time.monotonic() - started, 2)
                 total_seconds = round(time.monotonic() - captured_at, 2)
+                ready = time.monotonic()
+                try:
+                    with wave.open(io.BytesIO(output), "rb") as diagnostic_wav:
+                        audio_seconds = diagnostic_wav.getnframes()/diagnostic_wav.getframerate()
+                except Exception:
+                    audio_seconds = -1.0
+                log.info("DIAG tts lang=%s seq=%d audio_s=%.3f ready_interval_s=%.3f tts_depth=%d", language, seq, audio_seconds, ready-previous_ready if previous_ready is not None else -1.0, queue.qsize())
+                previous_ready = ready
                 await broadcast_stream(language, output)
                 await publish({"type": "segment", "seq": seq, "english": summary,
                                "language": language, "telugu": "", "kind": "minute_summary",
@@ -380,9 +399,11 @@ async def minute_summary_worker() -> None:
 
     async def gemini_job(index, wav, captured_at, context):
         started = time.monotonic()
+        log.info("DIAG gemini_start index=%d queue_wait_s=%.3f active=%d", index, started-captured_at, len(in_flight))
         try:
             result = await asyncio.to_thread(
                 summarize_telugu_audio, wav, max(1, round((len(wav)-44)/32000)), context)
+            log.info("DIAG gemini_end index=%d elapsed_s=%.3f", index, time.monotonic()-started)
             await completed.put((index, captured_at, round(time.monotonic()-started, 2), result, None))
         except Exception as exc:
             await completed.put((index, captured_at, round(time.monotonic()-started, 2), None, exc))
