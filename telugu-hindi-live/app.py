@@ -86,7 +86,9 @@ def stream_pcm(wav_bytes: bytes) -> bytes:
         pcm, _ = audioop.ratecv(pcm, 2, 1, rate, STREAM_RATE, None)
     return pcm
 
-async def broadcast_stream(language: str, wav_bytes: bytes) -> None:
+async def broadcast_stream(language: str, wav_bytes: bytes, ready_at=None) -> None:
+    if ready_at is None:
+        ready_at = time.monotonic()
     if not stream_clients[language]:
         return
     try:
@@ -97,8 +99,8 @@ async def broadcast_stream(language: str, wav_bytes: bytes) -> None:
     log.info("DIAG broadcast lang=%s pcm_s=%.3f clients=%d", language, len(pcm)/(STREAM_RATE*2), len(stream_clients[language]))
     for queue in tuple(stream_clients[language]):
         try:
-            queue.put_nowait(pcm)
-            log.info("DIAG enqueue lang=%s stream=%x depth=%d", language, id(queue), queue.qsize())
+            queue.put_nowait((pcm, ready_at))
+            log.info("DIAG enqueue lang=%s stream=%x depth=%d queued_pcm_s=%.3f", language, id(queue), queue.qsize(), sum(len(item[0]) for item in queue._queue)/(STREAM_RATE*2))
         except asyncio.QueueFull:
             log.warning("Listener streaming queue full; disconnecting slow stream")
             stream_clients[language].discard(queue)
@@ -151,19 +153,46 @@ async def continuous_stream(language: str, request: Request):
                 silent_seconds = 0.0
                 last_report = time.monotonic()
                 deadline = time.monotonic()
+                diag_start = deadline
+                diag_last = deadline
+                pcm_seconds = 0.0
+                last_pcm_seconds = 0.0
+                pipe_seconds = 0.0
+                pipe_max = 0.0
+                reset_seconds = 0.0
+                active_remaining = 0.0
 
                 async def write_frame(frame):
-                    nonlocal deadline
+                    nonlocal deadline, diag_last, pcm_seconds, last_pcm_seconds
+                    nonlocal pipe_seconds, pipe_max, reset_seconds, active_remaining
                     # Do not burst to catch up after a blocked pipe or event-loop stall.
-                    deadline = max(deadline, time.monotonic())
+                    now = time.monotonic()
+                    reset_seconds += max(0.0, now - deadline)
+                    deadline = max(deadline, now)
+                    pipe_start = time.monotonic()
                     proc.stdin.write(frame)
                     await proc.stdin.drain()
-                    deadline += len(frame) / (STREAM_RATE * 2)
+                    pipe_elapsed = time.monotonic() - pipe_start
+                    pipe_seconds += pipe_elapsed
+                    pipe_max = max(pipe_max, pipe_elapsed)
+                    duration = len(frame) / (STREAM_RATE * 2)
+                    deadline += duration
                     await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+                    pcm_seconds += duration
+                    active_remaining = max(0.0, active_remaining - duration)
+                    now = time.monotonic()
+                    if now - diag_last >= 5.0:
+                        wall = now - diag_last
+                        consumed = pcm_seconds - last_pcm_seconds
+                        queued = sum(len(item[0]) for item in queue._queue)/(STREAM_RATE*2)
+                        log.info("DIAG playback lang=%s stream=%x wall_s=%.3f pcm_s=%.3f pcm_rate=%.4f cumulative_drift_s=%.3f deadline_reset_s=%.3f pipe_write_s=%.3f pipe_max_s=%.3f queued_pcm_s=%.3f active_remaining_s=%.3f pending_pcm_s=%.3f depth=%d", language, id(queue), wall, consumed, consumed/wall, now-diag_start-pcm_seconds, reset_seconds, pipe_seconds, pipe_max, queued, active_remaining, queued+active_remaining, queue.qsize())
+                        diag_last = now
+                        last_pcm_seconds = pcm_seconds
+                        pipe_seconds = pipe_max = reset_seconds = 0.0
 
                 while proc.returncode is None:
                     try:
-                        pcm = queue.get_nowait()
+                        pcm, ready_at = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         await write_frame(silence)
                         silent_seconds += len(silence) / (STREAM_RATE * 2)
@@ -172,7 +201,8 @@ async def continuous_stream(language: str, request: Request):
                             last_report = time.monotonic()
                         continue
 
-                    log.info("DIAG feed lang=%s stream=%x speech_s=%.3f preceding_silence_s=%.2f depth=%d", language, id(queue), len(pcm)/(STREAM_RATE*2), silent_seconds, queue.qsize())
+                    active_remaining = len(pcm)/(STREAM_RATE*2)
+                    log.info("DIAG feed lang=%s stream=%x speech_s=%.3f preceding_silence_s=%.2f depth=%d ready_to_feed_s=%.3f queued_pcm_s=%.3f", language, id(queue), active_remaining, silent_seconds, queue.qsize(), time.monotonic()-ready_at, sum(len(item[0]) for item in queue._queue)/(STREAM_RATE*2))
                     silent_seconds = 0.0
                     for offset in range(0, len(pcm), frame_bytes):
                         await write_frame(pcm[offset:offset + frame_bytes])
@@ -399,7 +429,7 @@ async def minute_summary_worker() -> None:
                     audio_seconds = -1.0
                 log.info("DIAG tts lang=%s seq=%d audio_s=%.3f ready_interval_s=%.3f tts_depth=%d", language, seq, audio_seconds, ready-previous_ready if previous_ready is not None else -1.0, queue.qsize())
                 previous_ready = ready
-                await broadcast_stream(language, output)
+                await broadcast_stream(language, output, ready_at=ready)
                 await publish({"type": "segment", "seq": seq, "english": summary,
                                "language": language, "telugu": "", "kind": "minute_summary",
                                "audio": base64.b64encode(output).decode("ascii"),
