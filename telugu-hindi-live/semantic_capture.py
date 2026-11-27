@@ -5,7 +5,6 @@ Gemini subsequently produces the semantic summary. This is not an AI semantic
 endpoint detector, and the 18-second cap can split an unfinished sentence.
 """
 import audioop
-import collections
 import logging
 import queue
 import threading
@@ -44,11 +43,11 @@ class SemanticCapture:
     def run(self):
         import sounddevice as sd
         blocks = queue.Queue(maxsize=100)
-        # Noise-adaptive RMS VAD: no cloud dependency, 200 ms frames.
+        # RMS VAD selects boundaries only; never filters source samples.
+        # Cap the noise estimate to prevent speech-driven threshold escalation.
         noise_floor = 100.0
+        max_noise_floor = 120.0  # threshold ceiling: 360 PCM RMS
         pcm = bytearray()
-        pending = collections.deque(maxlen=5)  # one second of leading silence
-        has_speech = False
         quiet_frames = 0
         dropped = 0
         last_received = time.monotonic()
@@ -59,7 +58,7 @@ class SemanticCapture:
         callback_last = None
         callback_max_gap = 0.0
         received_samples = 0
-        discarded_samples = 0
+        discarded_samples = 0  # retained diagnostic: VAD never discards samples
         emitted_samples = 0
         rms_sum = 0
         rms_count = 0
@@ -85,7 +84,7 @@ class SemanticCapture:
                      max(240.0, noise_floor*3.0), noise_floor, callback_max_gap,
                      now-callback_last if callback_last is not None else -1.0,
                      blocks.qsize(), peak_depth,
-                     (len(pcm)+sum(map(len,pending)))/(RATE*2))
+                     len(pcm)/(RATE*2))
             previous_counts = counts
             report_at = now
             rms_sum = rms_count = rms_max = peak_depth = 0
@@ -111,14 +110,13 @@ class SemanticCapture:
                     self.on_error("Microphone overflow: source audio lost")
 
         def emit():
-            nonlocal pcm, has_speech, quiet_frames, emitted_samples
-            if has_speech and pcm:
+            nonlocal pcm, quiet_frames, emitted_samples
+            if pcm:
                 duration = len(pcm) / (RATE * 2)
                 self.on_window(wav_bytes(bytes(pcm)))
                 emitted_samples += len(pcm)//2
                 log.info("Emitted %.1fs real audio at natural pause or maximum duration", duration)
             pcm = bytearray()
-            has_speech = False
             quiet_frames = 0
 
         try:
@@ -144,18 +142,8 @@ class SemanticCapture:
                     threshold = max(240.0, noise_floor * 3.0)
                     speech = rms >= threshold
                     if not speech:
-                        noise_floor = 0.985 * noise_floor + 0.015 * rms
-                    if not has_speech:
-                        if not speech:
-                            if len(pending) == pending.maxlen:
-                                discarded_samples += len(pending[0])//2
-                            pending.append(block)
-                            report()
-                            continue
-                        # Include pre-roll, but never reuse it in another segment.
-                        pcm.extend(b"".join(pending))
-                        pending.clear()
-                        has_speech = True
+                        noise_floor = min(max_noise_floor, 0.985 * noise_floor + 0.015 * rms)
+                    # Preserve every processed block, including quiet speech and silence.
                     pcm.extend(block)
                     quiet_frames = 0 if speech else quiet_frames + 1
                     duration = len(pcm) / (RATE * 2)
@@ -164,7 +152,7 @@ class SemanticCapture:
                         and quiet_frames * frame_s >= self.pause_seconds):
                         emit()
                     report()
-                # Flush real speech on stop, even if shorter than minimum.
+                # Flush remaining processed audio on stop, even if shorter than minimum.
                 emit()
         except Exception as exc:
             log.exception("Continuous microphone capture failed")
