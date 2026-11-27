@@ -144,24 +144,38 @@ async def continuous_stream(language: str, request: Request):
                 "-f", "mp3", "-flush_packets", "1", "pipe:1",
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL)
-            # Keep the media stream alive with quiet PCM between summaries.
+            # Pace speech and silence on the same real-time PCM clock.
             async def feed():
-                silence = bytes(STREAM_RATE // 4 * 2)
-                silent_chunks = 0
+                frame_bytes = STREAM_RATE * 2 // 10  # 100 ms, mono s16le
+                silence = bytes(frame_bytes)
+                silent_seconds = 0.0
                 last_report = time.monotonic()
+                deadline = time.monotonic()
+
+                async def write_frame(frame):
+                    nonlocal deadline
+                    # Do not burst to catch up after a blocked pipe or event-loop stall.
+                    deadline = max(deadline, time.monotonic())
+                    proc.stdin.write(frame)
+                    await proc.stdin.drain()
+                    deadline += len(frame) / (STREAM_RATE * 2)
+                    await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+
                 while proc.returncode is None:
                     try:
-                        pcm = await asyncio.wait_for(queue.get(), timeout=.25)
-                        log.info("DIAG feed lang=%s stream=%x speech_s=%.3f preceding_silence_s=%.2f depth=%d", language, id(queue), len(pcm)/(STREAM_RATE*2), silent_chunks*.25, queue.qsize())
-                        silent_chunks = 0
-                    except asyncio.TimeoutError:
-                        pcm = silence
-                        silent_chunks += 1
+                        pcm = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        await write_frame(silence)
+                        silent_seconds += len(silence) / (STREAM_RATE * 2)
                         if time.monotonic() - last_report >= 5:
-                            log.info("DIAG starvation lang=%s stream=%x pending_silence_s=%.2f depth=%d", language, id(queue), silent_chunks*.25, queue.qsize())
+                            log.info("DIAG starvation lang=%s stream=%x pending_silence_s=%.2f depth=%d", language, id(queue), silent_seconds, queue.qsize())
                             last_report = time.monotonic()
-                    proc.stdin.write(pcm)
-                    await proc.stdin.drain()
+                        continue
+
+                    log.info("DIAG feed lang=%s stream=%x speech_s=%.3f preceding_silence_s=%.2f depth=%d", language, id(queue), len(pcm)/(STREAM_RATE*2), silent_seconds, queue.qsize())
+                    silent_seconds = 0.0
+                    for offset in range(0, len(pcm), frame_bytes):
+                        await write_frame(pcm[offset:offset + frame_bytes])
             writer = asyncio.create_task(feed())
             while not await request.is_disconnected():
                 chunk = await proc.stdout.read(4096)
